@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#111827" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <title>Shared Link - ClipVault</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div class="mark">CV</div>
+        <h1>Shared link</h1>
+        <p id="status">Reading shared content...</p>
+
+        <div class="result">
+          <label>Detected URL</label>
+          <textarea id="shared-url" readonly></textarea>
+        </div>
+
+        <div class="actions">
+          <button class="button" id="save-button" type="button">Save test</button>
+          <a class="button secondary" href="/">Home</a>
+        </div>
+
+        <p class="tiny">Saved test links stay in this browser only.</p>
+      </section>
+    </main>
+
+    <script src="/share.js" type="module"></script>
+  </body>
+</html>
