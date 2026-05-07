@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-import { Bot } from "grammy";
+import express from "express";
+import { Bot, webhookCallback } from "grammy";
 
 const telegramToken = requiredEnv("TELEGRAM_BOT_TOKEN");
 const supabaseUrl = requiredEnv("SUPABASE_URL");
@@ -9,6 +10,8 @@ const supabaseKey =
 const tableName = process.env.SUPABASE_TABLE || "saved_links";
 const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
 const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+const botMode = process.env.BOT_MODE || (process.env.RENDER ? "webhook" : "polling");
+const port = Number(process.env.PORT || 10000);
 
 if (!supabaseKey) {
   throw new Error("Missing required env var: SUPABASE_KEY");
@@ -177,11 +180,51 @@ bot.catch((err) => {
   console.error("bot error", err);
 });
 
-await bot.start({
-  onStart: (botInfo) => {
-    console.log(`Bot running as @${botInfo.username}`);
-  },
-});
+if (botMode === "webhook") {
+  await startWebhookServer();
+} else {
+  await bot.api.deleteWebhook();
+  await bot.start({
+    onStart: (botInfo) => {
+      console.log(`Bot polling as @${botInfo.username}`);
+    },
+  });
+}
+
+async function startWebhookServer(): Promise<void> {
+  const app = express();
+  const webhookPath = `/telegram/${getWebhookSecret()}`;
+  const externalUrl =
+    process.env.TELEGRAM_WEBHOOK_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    `http://localhost:${port}`;
+
+  app.get("/", (_req, res) => {
+    res.json({ ok: true, service: "LinkLoom bot" });
+  });
+
+  app.get("/health", (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  app.use(express.json());
+  app.post(webhookPath, webhookCallback(bot, "express"));
+
+  app.listen(port, "0.0.0.0", async () => {
+    const webhookUrl = `${externalUrl}${webhookPath}`;
+    await bot.api.setWebhook(webhookUrl);
+    const botInfo = await bot.api.getMe();
+    console.log(`Bot webhook running as @${botInfo.username}`);
+    console.log(`Webhook set: ${webhookUrl}`);
+  });
+}
+
+function getWebhookSecret(): string {
+  return (
+    process.env.WEBHOOK_SECRET ||
+    telegramToken.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64)
+  );
+}
 
 function requiredEnv(name: string): string {
   const value = process.env[name];
