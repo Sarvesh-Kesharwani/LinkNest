@@ -38,9 +38,15 @@ type PendingNote = {
 type SavedLinkRow = {
   id: string;
   platform: Platform;
+  original_url: string;
   canonical_url: string;
   note: string | null;
   created_at: string;
+};
+
+type ScoredSavedLink = SavedLinkRow & {
+  matchScore: number;
+  matchedFields: string[];
 };
 
 const pendingNotes = new Map<number, PendingNote>();
@@ -389,10 +395,10 @@ async function answerQuery(
 
   const { data, error } = await supabase
     .from(tableName)
-    .select("id, platform, canonical_url, note, created_at")
+    .select("id, platform, original_url, canonical_url, note, created_at")
     .eq("sender_id", senderId)
     .order("created_at", { ascending: false })
-    .limit(120);
+    .limit(500);
 
   if (error) {
     await reply(`Supabase query failed: ${error.message}`);
@@ -405,17 +411,41 @@ async function answerQuery(
     return;
   }
 
-  const answer = await queryDeepSeek(query, links);
-  await reply(answer);
+  const rankedMatches = rankSavedLinks(query, links);
+  const candidates =
+    rankedMatches.length > 0
+      ? rankedMatches.slice(0, 25)
+      : links.slice(0, 80).map((link) => ({
+          ...link,
+          matchScore: 0,
+          matchedFields: [],
+        }));
+
+  if (!deepseekApiKey) {
+    await reply(formatLocalSearchResults(query, rankedMatches.slice(0, 8)));
+    return;
+  }
+
+  const answer = await queryDeepSeek(query, candidates, {
+    totalSaved: links.length,
+    directMatches: rankedMatches.length,
+  });
+  await reply(limitTelegramMessage(answer));
 }
 
-async function queryDeepSeek(query: string, links: SavedLinkRow[]): Promise<string> {
+async function queryDeepSeek(
+  query: string,
+  links: ScoredSavedLink[],
+  searchStats: { totalSaved: number; directMatches: number },
+): Promise<string> {
   const linkContext = links
     .map((link, index) => {
       return [
         `${index + 1}. ${link.canonical_url}`,
         `platform: ${link.platform}`,
         `note: ${link.note || "(none)"}`,
+        `match_score: ${link.matchScore}`,
+        `matched_fields: ${link.matchedFields.join(", ") || "(semantic candidate)"}`,
         `saved: ${link.created_at}`,
       ].join("\n");
     })
@@ -433,21 +463,47 @@ async function queryDeepSeek(query: string, links: SavedLinkRow[]): Promise<stri
         {
           role: "system",
           content:
-            "You help search saved links. Return max 5 best matches. Include URL and short reason. If no match, say no good match.",
+            [
+              "You are LinkLoom, a professional saved-link search assistant.",
+              "Search only the provided saved links. Never invent links or notes.",
+              "Prefer high match_score results because they matched the user's note or URL directly.",
+              "Return a clean Telegram-friendly answer in plain text.",
+              "Format exactly:",
+              "Search results for: <query>",
+              "",
+              "1. <short useful label>",
+              "Platform: <platform>",
+              "Link: <url>",
+              "Note: <note or No note saved>",
+              "Why it matches: <short reason>",
+              "",
+              "Return up to 7 results. If no candidate is relevant, say: No saved item matched your query.",
+            ].join("\n"),
         },
         {
           role: "user",
-          content: `Query: ${query}\n\nSaved links:\n${linkContext}`,
+          content: [
+            `Query: ${query}`,
+            `Total saved links checked: ${searchStats.totalSaved}`,
+            `Direct note/link matches: ${searchStats.directMatches}`,
+            "",
+            `Candidate saved links:\n${linkContext}`,
+          ].join("\n"),
         },
       ],
       temperature: 0.2,
-      max_tokens: 700,
+      max_tokens: 1200,
     }),
   });
 
   if (!response.ok) {
     const body = await response.text();
-    return `DeepSeek failed: ${response.status} ${body.slice(0, 300)}`;
+    return [
+      "DeepSeek search failed.",
+      `Error: ${response.status} ${body.slice(0, 240)}`,
+      "",
+      formatLocalSearchResults(query, links.slice(0, 7)),
+    ].join("\n");
   }
 
   const json = (await response.json()) as {
@@ -455,6 +511,128 @@ async function queryDeepSeek(query: string, links: SavedLinkRow[]): Promise<stri
   };
 
   return json.choices?.[0]?.message?.content?.trim() || "No answer from DeepSeek.";
+}
+
+function rankSavedLinks(query: string, links: SavedLinkRow[]): ScoredSavedLink[] {
+  const normalizedQuery = normalizeSearchText(query);
+  const tokens = tokenizeSearchQuery(query);
+
+  return links
+    .map((link) => {
+      const note = normalizeSearchText(link.note || "");
+      const canonicalUrl = normalizeSearchText(link.canonical_url);
+      const originalUrl = normalizeSearchText(link.original_url);
+      const platform = normalizeSearchText(link.platform);
+      let matchScore = 0;
+      const matchedFields = new Set<string>();
+
+      for (const [field, value] of [
+        ["note", note],
+        ["link", canonicalUrl],
+        ["original link", originalUrl],
+        ["platform", platform],
+      ] as const) {
+        if (!value) continue;
+        if (normalizedQuery && value.includes(normalizedQuery)) {
+          matchScore += field === "note" ? 10 : 8;
+          matchedFields.add(field);
+        }
+
+        for (const token of tokens) {
+          if (value.includes(token)) {
+            matchScore += field === "note" ? 3 : 2;
+            matchedFields.add(field);
+          }
+        }
+      }
+
+      return {
+        ...link,
+        matchScore,
+        matchedFields: [...matchedFields],
+      };
+    })
+    .filter((link) => link.matchScore > 0)
+    .sort((a, b) => {
+      if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+      return Date.parse(b.created_at) - Date.parse(a.created_at);
+    });
+}
+
+function tokenizeSearchQuery(query: string): string[] {
+  const stopWords = new Set([
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "from",
+    "in",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "show",
+    "the",
+    "to",
+    "with",
+  ]);
+
+  return [...new Set(normalizeSearchText(query).split(" "))]
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !stopWords.has(token));
+}
+
+function normalizeSearchText(value: string): string {
+  try {
+    value = decodeURIComponent(value);
+  } catch {
+    // Keep original text when it is not valid URI-encoded content.
+  }
+
+  return value
+    .toLowerCase()
+    .replace(/https?:\/\//g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatLocalSearchResults(query: string, links: ScoredSavedLink[]): string {
+  if (links.length === 0) {
+    return [
+      `Search results for: ${query}`,
+      "",
+      "No saved item matched your query in notes or links.",
+    ].join("\n");
+  }
+
+  const results = links.slice(0, 7).flatMap((link, index) => [
+    `${index + 1}. ${getLinkLabel(link)}`,
+    `Platform: ${link.platform}`,
+    `Link: ${link.canonical_url}`,
+    `Note: ${link.note || "No note saved"}`,
+    `Why it matches: matched ${link.matchedFields.join(", ") || "saved link"}.`,
+    "",
+  ]);
+
+  return [`Search results for: ${query}`, "", ...results].join("\n").trim();
+}
+
+function getLinkLabel(link: SavedLinkRow): string {
+  try {
+    const url = new URL(link.canonical_url);
+    return url.hostname.replace(/^www\./, "");
+  } catch {
+    return link.platform;
+  }
+}
+
+function limitTelegramMessage(message: string): string {
+  const maxLength = 3900;
+  if (message.length <= maxLength) return message;
+  return `${message.slice(0, maxLength - 40).trim()}\n\nResults trimmed. Refine your query.`;
 }
 
 function dedupeLinks(links: LinkInfo[]): LinkInfo[] {
