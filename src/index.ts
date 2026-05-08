@@ -190,6 +190,7 @@ if (botMode === "webhook") {
   await startWebhookServer();
 } else {
   await bot.api.deleteWebhook();
+  await registerBotCommands();
   await bot.start({
     onStart: (botInfo) => {
       console.log(`Bot polling as @${botInfo.username}`);
@@ -218,11 +219,33 @@ async function startWebhookServer(): Promise<void> {
 
   app.listen(port, "0.0.0.0", async () => {
     const webhookUrl = `${externalUrl}${webhookPath}`;
+    await registerBotCommands();
     await bot.api.setWebhook(webhookUrl);
     const botInfo = await bot.api.getMe();
     console.log(`Bot webhook running as @${botInfo.username}`);
     console.log(`Webhook set: ${webhookUrl}`);
   });
+}
+
+async function registerBotCommands(): Promise<void> {
+  await bot.api.setMyCommands([
+    {
+      command: "start",
+      description: "Start LinkLoom",
+    },
+    {
+      command: "help",
+      description: "Show help",
+    },
+    {
+      command: "ask",
+      description: "Search saved links with a question",
+    },
+    {
+      command: "skip",
+      description: "Skip note for pending saved link",
+    },
+  ]);
 }
 
 function getWebhookSecret(): string {
