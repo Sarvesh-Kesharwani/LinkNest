@@ -49,6 +49,16 @@ type ScoredSavedLink = SavedLinkRow & {
   matchedFields: string[];
 };
 
+type QueryIntent = {
+  action: "list_all" | "search" | "recent" | "count";
+  terms: string[];
+  platform: Platform | "any";
+  includeNotesOnly: boolean;
+  limit: number;
+  sort: "newest" | "oldest" | "relevance";
+  reason: string;
+};
+
 const pendingNotes = new Map<number, PendingNote>();
 
 bot.command("start", async (ctx) => {
@@ -411,34 +421,33 @@ async function answerQuery(
     return;
   }
 
-  if (!deepseekApiKey) {
-    await reply("DeepSeek key missing. Set DEEPSEEK_API_KEY in .env.");
+  const intent = await understandQueryIntent(query);
+  let links: SavedLinkRow[];
+  let totalCount: number;
+  try {
+    const result = await fetchSavedLinksForIntent(senderId, intent);
+    links = result.links;
+    totalCount = result.totalCount;
+  } catch (error) {
+    await reply(error instanceof Error ? error.message : "Supabase query failed.");
     return;
   }
 
-  const { data, error } = await supabase
-    .from(tableName)
-    .select("id, platform, original_url, canonical_url, note, created_at")
-    .eq("sender_id", senderId)
-    .order("created_at", { ascending: false })
-    .limit(500);
-
-  if (error) {
-    await reply(`Supabase query failed: ${error.message}`);
-    return;
-  }
-
-  const links = (data ?? []) as SavedLinkRow[];
-  if (links.length === 0) {
+  if (totalCount === 0) {
     await reply("No saved links yet.");
+    return;
+  }
+
+  if (links.length === 0) {
+    await reply(`No saved item matched: ${query}`);
     return;
   }
 
   const rankedMatches = rankSavedLinks(query, links);
   const candidates =
-    rankedMatches.length > 0
+    intent.action === "search" && rankedMatches.length > 0
       ? rankedMatches.slice(0, 25)
-      : links.slice(0, 80).map((link) => ({
+      : links.slice(0, intent.action === "list_all" ? 120 : 80).map((link) => ({
           ...link,
           matchScore: 0,
           matchedFields: [],
@@ -449,17 +458,255 @@ async function answerQuery(
     return;
   }
 
-  const answer = await queryDeepSeek(query, candidates, {
-    totalSaved: links.length,
+  const answer = await formatAnswerWithDeepSeek(query, candidates, intent, {
+    totalSaved: totalCount,
     directMatches: rankedMatches.length,
+    returnedFromDb: links.length,
   });
   await reply(limitTelegramMessage(answer));
 }
 
-async function queryDeepSeek(
+async function understandQueryIntent(query: string): Promise<QueryIntent> {
+  if (!deepseekApiKey) {
+    return fallbackQueryIntent(query);
+  }
+
+  const response = await fetch("https://api.deepseek.com/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${deepseekApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: deepseekModel,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You classify a Telegram user's saved-link query before database access.",
+            "Return JSON only. No markdown.",
+            "Schema:",
+            "{",
+            '  "action": "list_all" | "search" | "recent" | "count",',
+            '  "terms": ["keyword"],',
+            '  "platform": "instagram" | "youtube" | "webpage" | "unknown" | "any",',
+            '  "includeNotesOnly": boolean,',
+            '  "limit": number,',
+            '  "sort": "newest" | "oldest" | "relevance",',
+            '  "reason": "short reason"',
+            "}",
+            "Rules:",
+            "- If user asks list all/everything/all notes/all saved so far, action=list_all, terms=[].",
+            "- If user asks latest/recent, action=recent.",
+            "- If user asks how many/count, action=count.",
+            "- If user asks find/search/about a topic, action=search and put important search terms.",
+            "- Detect platform from words like reels/instagram/insta/youtube/shorts/webpage.",
+            "- limit default 50, list_all 1000, recent 20, search 80, count 1.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: query,
+        },
+      ],
+      temperature: 0,
+      max_tokens: 350,
+    }),
+  });
+
+  if (!response.ok) {
+    return fallbackQueryIntent(query);
+  }
+
+  const json = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = json.choices?.[0]?.message?.content ?? "";
+  return normalizeQueryIntent(parseIntentJson(content), query);
+}
+
+function parseIntentJson(content: string): Partial<QueryIntent> | null {
+  const trimmed = content.trim();
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+
+  try {
+    return JSON.parse(jsonMatch[0]) as Partial<QueryIntent>;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeQueryIntent(
+  parsed: Partial<QueryIntent> | null,
+  query: string,
+): QueryIntent {
+  const fallback = fallbackQueryIntent(query);
+  if (!parsed) return fallback;
+
+  const action = ["list_all", "search", "recent", "count"].includes(
+    String(parsed.action),
+  )
+    ? (parsed.action as QueryIntent["action"])
+    : fallback.action;
+  const platform = ["instagram", "youtube", "webpage", "unknown", "any"].includes(
+    String(parsed.platform),
+  )
+    ? (parsed.platform as QueryIntent["platform"])
+    : fallback.platform;
+  const sort = ["newest", "oldest", "relevance"].includes(String(parsed.sort))
+    ? (parsed.sort as QueryIntent["sort"])
+    : fallback.sort;
+  const limit = clampNumber(Number(parsed.limit) || fallback.limit, 1, 1000);
+  const terms = Array.isArray(parsed.terms)
+    ? parsed.terms
+        .map((term) => String(term).trim())
+        .filter((term) => term.length > 0)
+        .slice(0, 12)
+    : fallback.terms;
+
+  return {
+    action,
+    terms,
+    platform,
+    includeNotesOnly: Boolean(parsed.includeNotesOnly ?? fallback.includeNotesOnly),
+    limit,
+    sort,
+    reason: String(parsed.reason || fallback.reason).slice(0, 200),
+  };
+}
+
+function fallbackQueryIntent(query: string): QueryIntent {
+  const normalized = normalizeSearchText(query);
+  const wantsAll = /\b(all|everything|list|saved so far|all notes|saare|sare)\b/.test(
+    normalized,
+  );
+  const wantsCount = /\b(count|how many|kitne|number)\b/.test(normalized);
+  const wantsRecent = /\b(recent|latest|newest|last)\b/.test(normalized);
+  const platform = inferPlatformFromQuery(normalized);
+
+  if (wantsCount) {
+    return {
+      action: "count",
+      terms: [],
+      platform,
+      includeNotesOnly: false,
+      limit: 1,
+      sort: "newest",
+      reason: "Fallback detected count request.",
+    };
+  }
+
+  if (wantsAll) {
+    return {
+      action: "list_all",
+      terms: [],
+      platform,
+      includeNotesOnly: normalized.includes("note"),
+      limit: 1000,
+      sort: "newest",
+      reason: "Fallback detected list-all request.",
+    };
+  }
+
+  if (wantsRecent) {
+    return {
+      action: "recent",
+      terms: [],
+      platform,
+      includeNotesOnly: false,
+      limit: 20,
+      sort: "newest",
+      reason: "Fallback detected recent request.",
+    };
+  }
+
+  return {
+    action: "search",
+    terms: tokenizeSearchQuery(query).slice(0, 8),
+    platform,
+    includeNotesOnly: false,
+    limit: 80,
+    sort: "relevance",
+    reason: "Fallback detected keyword search.",
+  };
+}
+
+function inferPlatformFromQuery(normalizedQuery: string): QueryIntent["platform"] {
+  if (/\b(instagram|insta|reel|reels)\b/.test(normalizedQuery)) return "instagram";
+  if (/\b(youtube|yt|short|shorts)\b/.test(normalizedQuery)) return "youtube";
+  if (/\b(webpage|article|page|website|blog)\b/.test(normalizedQuery)) {
+    return "webpage";
+  }
+  return "any";
+}
+
+async function fetchSavedLinksForIntent(
+  senderId: number,
+  intent: QueryIntent,
+): Promise<{ links: SavedLinkRow[]; totalCount: number }> {
+  let request = supabase
+    .from(tableName)
+    .select("id, platform, original_url, canonical_url, note, created_at", {
+      count: "exact",
+    })
+    .eq("sender_id", senderId);
+
+  if (intent.platform !== "any") {
+    request = request.eq("platform", intent.platform);
+  }
+
+  if (intent.includeNotesOnly) {
+    request = request.not("note", "is", null);
+  }
+
+  const searchTerms =
+    intent.action === "search" ? sanitizeDbSearchTerms(intent.terms) : [];
+  if (searchTerms.length > 0) {
+    request = request.or(buildSearchOrFilter(searchTerms));
+  }
+
+  request = request.order("created_at", { ascending: intent.sort === "oldest" });
+  request = request.limit(intent.limit);
+
+  const { data, error, count } = await request;
+  if (error) {
+    throw new Error(`Supabase query failed: ${error.message}`);
+  }
+
+  return {
+    links: (data ?? []) as SavedLinkRow[],
+    totalCount: count ?? data?.length ?? 0,
+  };
+}
+
+function sanitizeDbSearchTerms(terms: string[]): string[] {
+  return terms
+    .flatMap((term) => tokenizeSearchQuery(term))
+    .map((term) => term.replace(/[^a-z0-9_-]/gi, ""))
+    .filter((term) => term.length >= 2)
+    .slice(0, 6);
+}
+
+function buildSearchOrFilter(terms: string[]): string {
+  return terms
+    .flatMap((term) => [
+      `note.ilike.%${term}%`,
+      `canonical_url.ilike.%${term}%`,
+      `original_url.ilike.%${term}%`,
+    ])
+    .join(",");
+}
+
+async function formatAnswerWithDeepSeek(
   query: string,
   links: ScoredSavedLink[],
-  searchStats: { totalSaved: number; directMatches: number },
+  intent: QueryIntent,
+  searchStats: {
+    totalSaved: number;
+    directMatches: number;
+    returnedFromDb: number;
+  },
 ): Promise<string> {
   const linkContext = links
     .map((link, index) => {
@@ -489,6 +736,7 @@ async function queryDeepSeek(
             [
               "You are LinkLoom, a professional saved-link search assistant.",
               "Search only the provided saved links. Never invent links or notes.",
+              "The user's intent was interpreted before DB query. Respect that intent.",
               "Prefer high match_score results because they matched the user's note or URL directly.",
               "Return a clean Telegram-friendly answer in plain text.",
               "Format exactly:",
@@ -500,14 +748,18 @@ async function queryDeepSeek(
               "Note: <note or No note saved>",
               "Why it matches: <short reason>",
               "",
-              "Return up to 7 results. If no candidate is relevant, say: No saved item matched your query.",
+              "For list_all, list as many provided candidates as fit; do not limit to 7.",
+              "For count, give count first, then optional short breakdown.",
+              "For search/recent, return up to 7 results. If no candidate is relevant, say: No saved item matched your query.",
             ].join("\n"),
         },
         {
           role: "user",
           content: [
             `Query: ${query}`,
+            `Interpreted intent: ${JSON.stringify(intent)}`,
             `Total saved links checked: ${searchStats.totalSaved}`,
+            `Rows returned from database: ${searchStats.returnedFromDb}`,
             `Direct note/link matches: ${searchStats.directMatches}`,
             "",
             `Candidate saved links:\n${linkContext}`,
@@ -656,6 +908,10 @@ function limitTelegramMessage(message: string): string {
   const maxLength = 3900;
   if (message.length <= maxLength) return message;
   return `${message.slice(0, maxLength - 40).trim()}\n\nResults trimmed. Refine your query.`;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
 function dedupeLinks(links: LinkInfo[]): LinkInfo[] {
