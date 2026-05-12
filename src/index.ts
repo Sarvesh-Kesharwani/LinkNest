@@ -76,6 +76,8 @@ bot.command("help", async (ctx) => {
     [
       "Send links: saves to Supabase.",
       "After save: reply with note, or /skip.",
+      "Reply to an earlier link with text to update its note.",
+      "Update note: /note <link> <new note>",
       "Query: /ask <natural language query>",
       "Shortcut query: ? <query>",
     ].join("\n"),
@@ -107,6 +109,34 @@ bot.command("ask", async (ctx) => {
   await answerQuery(ctx.from?.id, query, async (message) => ctx.reply(message));
 });
 
+bot.command(["note", "setnote"], async (ctx) => {
+  const sender = ctx.from;
+  if (!sender) {
+    await ctx.reply("Could not identify sender.");
+    return;
+  }
+
+  const input = ctx.match.trim();
+  const commandLinks = extractLinks(input).map(normalizeLink);
+  if (commandLinks.length === 0) {
+    await ctx.reply("Use: /note <saved link> <new note>");
+    return;
+  }
+
+  const note = removeUrlsFromText(input).trim();
+  if (!note) {
+    await ctx.reply("Send note text after the link. Example: /note https://... useful cooking idea");
+    return;
+  }
+
+  const updated = await saveNoteForLinks(sender.id, commandLinks, note);
+  await ctx.reply(
+    updated > 0
+      ? `${updated} note updated.`
+      : "No saved item matched that link.",
+  );
+});
+
 bot.on("message", async (ctx) => {
   const text = ctx.message.text ?? ctx.message.caption ?? "";
   const sender = ctx.from;
@@ -125,6 +155,17 @@ bot.on("message", async (ctx) => {
   const links = extractLinks(text).map(normalizeLink);
 
   if (links.length === 0) {
+    const replyLinks = extractLinksFromReply(ctx.message).map(normalizeLink);
+    if (replyLinks.length > 0 && text.trim()) {
+      const updated = await saveNoteForLinks(sender.id, replyLinks, text.trim());
+      await ctx.reply(
+        updated > 0
+          ? `${updated} note updated.`
+          : "I could not find that replied link in your saved items.",
+      );
+      return;
+    }
+
     const pending = pendingNotes.get(sender.id);
     if (pending) {
       await saveNote(pending.linkIds, text.trim());
@@ -167,6 +208,14 @@ bot.on("message", async (ctx) => {
 
     if (error.code === "23505") {
       duplicate += 1;
+      const existing = await findSavedLinkByCanonicalUrl(
+        sender.id,
+        link.canonicalUrl,
+      );
+      if (existing) {
+        savedIds.push(existing.id);
+        savedUrls.push(existing.canonical_url);
+      }
       continue;
     }
 
@@ -252,6 +301,10 @@ async function registerBotCommands(): Promise<void> {
       description: "Search saved links with a question",
     },
     {
+      command: "note",
+      description: "Update note for a saved link",
+    },
+    {
       command: "skip",
       description: "Skip note for pending saved link",
     },
@@ -276,6 +329,18 @@ function requiredEnv(name: string): string {
 function extractLinks(text: string): string[] {
   const matches = text.match(/https?:\/\/[^\s<>"']+/gi) ?? [];
   return matches.map((url) => url.replace(/[),.;!?]+$/g, ""));
+}
+
+function extractLinksFromReply(message: {
+  reply_to_message?: { text?: string; caption?: string };
+}): string[] {
+  const repliedText =
+    message.reply_to_message?.text ?? message.reply_to_message?.caption ?? "";
+  return extractLinks(repliedText);
+}
+
+function removeUrlsFromText(text: string): string {
+  return text.replace(/https?:\/\/[^\s<>"']+/gi, " ").replace(/\s+/g, " ");
 }
 
 function normalizeLink(originalUrl: string): LinkInfo {
@@ -390,6 +455,65 @@ async function saveNote(linkIds: string[], note: string): Promise<void> {
   if (error) {
     throw new Error(`Failed to save note: ${error.message}`);
   }
+}
+
+async function saveNoteForLinks(
+  senderId: number,
+  links: LinkInfo[],
+  note: string,
+): Promise<number> {
+  const savedLinks = await findSavedLinksByCanonicalUrls(
+    senderId,
+    dedupeLinks(links).map((link) => link.canonicalUrl),
+  );
+  if (savedLinks.length === 0) {
+    return 0;
+  }
+
+  await saveNote(
+    savedLinks.map((link) => link.id),
+    note,
+  );
+  return savedLinks.length;
+}
+
+async function findSavedLinksByCanonicalUrls(
+  senderId: number,
+  canonicalUrls: string[],
+): Promise<Array<{ id: string; canonical_url: string }>> {
+  if (canonicalUrls.length === 0) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from(tableName)
+    .select("id, canonical_url")
+    .eq("sender_id", senderId)
+    .in("canonical_url", canonicalUrls);
+
+  if (error) {
+    throw new Error(`Failed to find saved links: ${error.message}`);
+  }
+
+  return data ?? [];
+}
+
+async function findSavedLinkByCanonicalUrl(
+  senderId: number,
+  canonicalUrl: string,
+): Promise<{ id: string; canonical_url: string } | null> {
+  const { data, error } = await supabase
+    .from(tableName)
+    .select("id, canonical_url")
+    .eq("sender_id", senderId)
+    .eq("canonical_url", canonicalUrl)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to find saved link: ${error.message}`);
+  }
+
+  return data;
 }
 
 async function updateNoteStatus(
