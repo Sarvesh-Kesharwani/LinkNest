@@ -1,3 +1,7 @@
+-- LinkNest bot schema. Idempotent. Two tables:
+--   saved_links     — legacy URL-saver (kept for back-compat with old data).
+--   linknest_notes  — quick text-only notes saved via /linknest.
+
 create extension if not exists pgcrypto;
 
 create table if not exists public.saved_links (
@@ -72,3 +76,35 @@ create trigger saved_links_set_updated_at
 before update on public.saved_links
 for each row
 execute function public.set_saved_links_updated_at();
+
+-- /linknest text-only notes ---------------------------------------------------
+
+create table if not exists public.linknest_notes (
+  id uuid primary key default gen_random_uuid(),
+  sender_id bigint not null,
+  sender_username text,
+  chat_id bigint,
+  text text not null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.linknest_notes enable row level security;
+
+grant select, insert on public.linknest_notes to anon;
+
+drop policy if exists linknest_notes_bot_select on public.linknest_notes;
+create policy linknest_notes_bot_select
+on public.linknest_notes
+for select
+to anon
+using (true);
+
+drop policy if exists linknest_notes_bot_insert on public.linknest_notes;
+create policy linknest_notes_bot_insert
+on public.linknest_notes
+for insert
+to anon
+with check (true);
+
+create index if not exists linknest_notes_sender_created_idx
+  on public.linknest_notes (sender_id, created_at desc);

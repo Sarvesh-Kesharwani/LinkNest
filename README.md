@@ -1,41 +1,36 @@
-# LinkLoom Bot
+# LinkNest Bot
 
-Telegram bot that saves any URL into Supabase, asks for a note, and lets you query saved links with DeepSeek.
+Telegram bot with two commands:
+
+- `/linknest <note>` — save a quick text note to the **LinkNest** Supabase project (`linknest_notes` table).
+- `/thought <text>` — save a raw thought to the **ChatThoughts** Supabase project (`chatthoughts_thoughts` table). The web app at https://chatthoughts.vercel.app re-augments these on first edit.
 
 ## Setup
 
 1. Create bot in Telegram with `@BotFather`, copy token.
-2. Create new Supabase project.
-3. Run `supabase-schema.sql` in Supabase SQL Editor.
-4. Supabase Project Settings -> API:
-   - `SUPABASE_URL` = Project URL
-   - `SUPABASE_KEY` = service role secret key, or publishable key if using the included RLS policies
-5. DeepSeek dashboard -> create API key.
-6. Copy `.env.example` to `.env` and fill values.
-7. Run:
+2. **LinkNest Supabase** — run `supabase-schema.sql` in the SQL editor (idempotent; creates `saved_links` legacy + `linknest_notes`).
+3. **ChatThoughts Supabase** — already provisioned in the `todotrails` project. The bot writes into `chatthoughts_thoughts` directly.
+4. Copy `.env.example` → `.env` and fill values.
+5. Run:
 
 ```bash
 npm install
 npm run dev
 ```
 
-Keep `SUPABASE_KEY` and `DEEPSEEK_API_KEY` server-only. Never expose them in browser code.
+Keep all Supabase keys server-only.
 
-## Use
+## Env vars
 
-Send any message containing links. Bot saves them, then asks for a note.
+| Key | Purpose |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | BotFather token |
+| `SUPABASE_URL` / `SUPABASE_KEY` | LinkNest project (for `/linknest`) |
+| `LINKNEST_TABLE` | Default `linknest_notes` |
+| `CHATTHOUGHTS_SUPABASE_URL` / `CHATTHOUGHTS_SUPABASE_KEY` | ChatThoughts project (for `/thought`) |
+| `CHATTHOUGHTS_TABLE` | Default `chatthoughts_thoughts` |
+| `BOT_MODE` | `polling` (dev) or `webhook` (Render) |
 
-Supported:
+## Deploy (Render)
 
-- `https://www.instagram.com/reel/...`
-- `https://youtube.com/shorts/...`
-- any webpage link
-
-Duplicates are blocked per Telegram sender.
-
-Commands:
-
-- `/start` setup hint
-- `/skip` skip note for last saved links
-- `/ask cooking reels` query saved links with DeepSeek
-- `? cooking reels` same as `/ask`
+`render.yaml` describes the service. Push to `main` → Render auto-deploys.

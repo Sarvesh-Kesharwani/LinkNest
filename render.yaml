@@ -13,11 +13,13 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
-      - key: SUPABASE_TABLE
-        value: saved_links
+      - key: LINKNEST_TABLE
+        value: linknest_notes
+      - key: CHATTHOUGHTS_SUPABASE_URL
+        sync: false
+      - key: CHATTHOUGHTS_SUPABASE_KEY
+        sync: false
+      - key: CHATTHOUGHTS_TABLE
+        value: chatthoughts_thoughts
       - key: BOT_MODE
         value: webhook
-      - key: DEEPSEEK_API_KEY
-        sync: false
-      - key: DEEPSEEK_MODEL
-        value: deepseek-chat
