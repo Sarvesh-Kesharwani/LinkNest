@@ -52,6 +52,7 @@ type BotContext = Context;
 
 type BotIntent =
   | { type: "save_link"; link?: string; note?: string }
+  | { type: "save_tubeo_video"; link?: string; note?: string }
   | { type: "save_thought"; text?: string }
   | { type: "save_youtube_channel"; link?: string }
   | { type: "list_saved_links"; query?: string }
@@ -72,6 +73,7 @@ const chatthoughts: SupabaseClient | null =
     : null;
 
 const URL_RE = /https?:\/\/\S+/i;
+const localConversationCache = new Map<string, ConversationRow>();
 
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
@@ -90,6 +92,9 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
   switch (intent.type) {
     case "save_link":
       await handleSaveLinkIntent(ctx, text, intent);
+      return;
+    case "save_tubeo_video":
+      await handleSaveTubeoVideoIntent(ctx, text, intent);
       return;
     case "save_thought":
       await handleSaveThoughtIntent(ctx, text, intent);
@@ -126,10 +131,10 @@ if (botMode === "webhook") {
 }
 
 async function classifyIntent(ctx: BotContext, text: string): Promise<BotIntent> {
-  const fallback = ruleClassifyIntent(text);
+  const conversation = await readConversation(ctx).catch(() => null);
+  const fallback = ruleClassifyIntent(text, conversation);
   if (!deepseekApiKey) return fallback;
 
-  const conversation = await readConversation(ctx).catch(() => null);
   const recent = (conversation?.recent_messages || [])
     .slice(-8)
     .map((turn) => `${turn.role}: ${turn.text}`)
@@ -141,13 +146,16 @@ async function classifyIntent(ctx: BotContext, text: string): Promise<BotIntent>
         role: "system",
         content: [
           "Classify one Telegram bot user message into JSON only.",
-          "Allowed types: save_link, save_thought, save_youtube_channel, list_saved_links, list_saved_thoughts, clarify.",
+          "Allowed types: save_link, save_tubeo_video, save_thought, save_youtube_channel, list_saved_links, list_saved_thoughts, clarify.",
           "Never infer save intent from a bare link. Bare link => clarify.",
+          "Use recent turns to resolve references like this/that/it/previous link/last link.",
+          "If current message gives instruction plus note for a previous link, include that prior link.",
           "Save link only when user explicitly asks to save/store/add/bookmark a link.",
+          "save_tubeo_video means save a YouTube video/watch-later item to Tubeo. Include note if user gives one.",
           "Save thought only when user explicitly asks to save a thought/note/idea.",
           "Save YouTube channel only when user explicitly asks to save/add the channel from a YouTube link.",
           "List links/thoughts only when user asks to show/list/get saved items.",
-          'Return compact JSON like {"type":"save_link","link":"https://...","note":"optional"} or {"type":"clarify","question":"short question"}',
+          'Return compact JSON like {"type":"save_tubeo_video","link":"https://...","note":"optional"} or {"type":"clarify","question":"short question"}',
         ].join(" "),
       },
       {
@@ -155,35 +163,41 @@ async function classifyIntent(ctx: BotContext, text: string): Promise<BotIntent>
         content: `Conversation summary:\n${conversation?.summary || "(none)"}\n\nRecent turns:\n${recent || "(none)"}\n\nMessage:\n${text}`,
       },
     ]);
-    return normalizeIntent(JSON.parse(jsonOnly(raw)), fallback, text);
+    return normalizeIntent(JSON.parse(jsonOnly(raw)), fallback, text, conversation);
   } catch (error) {
     console.error("intent classification failed", error);
     return fallback;
   }
 }
 
-function ruleClassifyIntent(text: string): BotIntent {
+function ruleClassifyIntent(text: string, conversation?: ConversationRow | null): BotIntent {
   const clean = text.trim();
-  const url = extractFirstUrl(clean);
+  const currentUrl = extractFirstUrl(clean);
+  const recentUrl = findRecentUserUrl(conversation);
+  const url = currentUrl || recentUrl;
   const lower = clean.toLowerCase();
   const asksList = /\b(list|show|get|what|which|display)\b/.test(lower);
   const asksSave = /\b(save|store|add|bookmark|remember|keep)\b/.test(lower);
   const saysThought = /\b(thought|thoughts|note|notes|idea|ideas)\b/.test(lower);
   const saysLink = /\b(link|links|url|urls|watch later|archive)\b/.test(lower);
   const saysChannel = /\b(channel|channels|creator|youtube channel)\b/.test(lower);
+  const saysTubeoVideo = isTubeoVideoRequest(clean) && !saysChannel;
 
   if (asksList && saysThought) return { type: "list_saved_thoughts" };
   if (asksList && (saysLink || /\bsaved\b/.test(lower))) return { type: "list_saved_links" };
   if (url && asksSave && saysChannel && isYouTubeUrl(url)) {
     return { type: "save_youtube_channel", link: url };
   }
+  if (url && (asksSave || saysTubeoVideo) && saysTubeoVideo && isYouTubeUrl(url)) {
+    return { type: "save_tubeo_video", link: url, note: extractSaveNote(clean, currentUrl || url) };
+  }
   if (url && asksSave) {
-    return { type: "save_link", link: url, note: extractSaveNote(clean, url) };
+    return { type: "save_link", link: url, note: extractSaveNote(clean, currentUrl || url) };
   }
   if (!url && asksSave && saysThought) {
     return { type: "save_thought", text: stripSaveWords(clean) };
   }
-  if (url) {
+  if (currentUrl) {
     return {
       type: "clarify",
       question: "What should I do with this link: save it, save its YouTube channel, or ignore it?",
@@ -195,20 +209,32 @@ function ruleClassifyIntent(text: string): BotIntent {
   };
 }
 
-function normalizeIntent(value: unknown, fallback: BotIntent, originalText: string): BotIntent {
+function normalizeIntent(
+  value: unknown,
+  fallback: BotIntent,
+  originalText: string,
+  conversation?: ConversationRow | null,
+): BotIntent {
   if (!value || typeof value !== "object") return fallback;
   const obj = value as Record<string, unknown>;
   const type = typeof obj.type === "string" ? obj.type : "";
   const link =
     typeof obj.link === "string" && obj.link.trim()
       ? obj.link.trim()
-      : extractFirstUrl(originalText);
+      : extractFirstUrl(originalText) || findRecentUserUrl(conversation);
   const note = typeof obj.note === "string" ? obj.note.trim() : undefined;
   const query = typeof obj.query === "string" ? obj.query.trim() : undefined;
   const text = typeof obj.text === "string" ? obj.text.trim() : undefined;
 
   if (type === "save_link") {
     if (!link) return { type: "clarify", question: "Which link should I save?" };
+    if (isTubeoVideoRequest(originalText) && isYouTubeUrl(link)) {
+      return { type: "save_tubeo_video", link, note };
+    }
+    return { type, link, note };
+  }
+  if (type === "save_tubeo_video") {
+    if (!link) return { type: "clarify", question: "Which YouTube video should I save to Tubeo?" };
     return { type, link, note };
   }
   if (type === "save_thought") {
@@ -240,6 +266,44 @@ async function handleSaveLinkIntent(
   if (rowId == null) return;
   const reply = intent.note ? "Saved link with note." : "Saved link.";
   await replyAndRemember(ctx, text, reply);
+}
+
+async function handleSaveTubeoVideoIntent(
+  ctx: BotContext,
+  text: string,
+  intent: Extract<BotIntent, { type: "save_tubeo_video" }>,
+): Promise<void> {
+  const sender = ctx.from;
+  const link = intent.link || extractFirstUrl(text);
+  if (!sender || !link) {
+    await replyAndRemember(ctx, text, "Which YouTube video should I save to Tubeo?");
+    return;
+  }
+  if (!isYouTubeUrl(link)) {
+    await replyAndRemember(ctx, text, "That is not a YouTube video link. Send a YouTube link.");
+    return;
+  }
+  if (!isTubeoConfigured()) {
+    await replyAndRemember(ctx, text, "Tubeo ingest is not configured, so I cannot save the video yet.");
+    return;
+  }
+  if (!isTubeoUserAllowed(sender.id)) {
+    await replyAndRemember(ctx, text, "This Telegram user is not allowed to save Tubeo videos.");
+    return;
+  }
+
+  const noteLine = intent.note?.trim() ? `\nnote: ${intent.note.trim()}` : "";
+  const result = await callTubeoIngest({
+    text: `save this youtube video to watch later ${link}${noteLine}`,
+    lastUrl: link,
+    telegramUserId: sender.id,
+    telegramMessageId: ctx.msg?.message_id ?? 0,
+  });
+  if (!result.ok) {
+    await replyAndRemember(ctx, text, `Tubeo save failed: ${result.error || "unknown error"}`);
+    return;
+  }
+  await replyAndRemember(ctx, text, `Saved to Tubeo. ${result.summary || ""}`.trim());
 }
 
 async function handleSaveThoughtIntent(
@@ -463,6 +527,7 @@ async function rememberTurn(
   if (!sender) return;
   const chatId = ctx.chat?.id ?? sender.id;
   const now = new Date().toISOString();
+  const key = conversationKey(sender.id, chatId);
 
   const { data, error } = await linknest
     .from(conversationTable)
@@ -470,10 +535,17 @@ async function rememberTurn(
     .eq("sender_id", sender.id)
     .eq("chat_id", chatId)
     .maybeSingle();
-  if (error) throw error;
+  if (error) {
+    console.error("conversation read failed; using local cache", error.message);
+  }
 
-  const row = data as ConversationRow | null;
-  const previous = Array.isArray(row?.recent_messages) ? row.recent_messages : [];
+  const row = error ? null : (data as ConversationRow | null);
+  const cached = localConversationCache.get(key);
+  const previous = Array.isArray(row?.recent_messages)
+    ? row.recent_messages
+    : Array.isArray(cached?.recent_messages)
+      ? cached.recent_messages
+      : [];
   const next = [
     ...previous,
     { role: "user" as const, text: userText.slice(0, 2000), at: now },
@@ -481,10 +553,12 @@ async function rememberTurn(
   ];
   const overflow = next.length > 20 ? next.slice(0, next.length - 16) : [];
   const recent = next.slice(-16);
+  const existingSummary = row?.summary || cached?.summary || "";
   const summary =
     overflow.length > 0
-      ? await summarizeConversation(row?.summary || "", overflow)
-      : row?.summary || "";
+      ? await summarizeConversation(existingSummary, overflow)
+      : existingSummary;
+  localConversationCache.set(key, { summary, recent_messages: recent });
 
   const { error: upsertError } = await linknest
     .from(conversationTable)
@@ -499,7 +573,9 @@ async function rememberTurn(
       },
       { onConflict: "sender_id,chat_id" },
     );
-  if (upsertError) throw upsertError;
+  if (upsertError) {
+    console.error("conversation upsert failed; local cache retained", upsertError.message);
+  }
 }
 
 async function summarizeConversation(
@@ -743,14 +819,24 @@ async function readConversation(ctx: BotContext): Promise<ConversationRow | null
   const sender = ctx.from;
   if (!sender) return null;
   const chatId = ctx.chat?.id ?? sender.id;
+  const key = conversationKey(sender.id, chatId);
   const { data, error } = await linknest
     .from(conversationTable)
     .select("summary, recent_messages")
     .eq("sender_id", sender.id)
     .eq("chat_id", chatId)
     .maybeSingle();
-  if (error) throw error;
-  return data as ConversationRow | null;
+  if (error) {
+    console.error("conversation read failed; using local cache", error.message);
+    return localConversationCache.get(key) || null;
+  }
+  const row = data as ConversationRow | null;
+  if (row) localConversationCache.set(key, row);
+  return row || localConversationCache.get(key) || null;
+}
+
+function conversationKey(senderId: number, chatId: number): string {
+  return `${senderId}:${chatId}`;
 }
 
 async function callDeepSeek(
@@ -877,6 +963,17 @@ function extractFirstUrl(text: string | undefined): string | undefined {
   return match?.[0]?.replace(/[),.;!?]+$/g, "");
 }
 
+function findRecentUserUrl(conversation?: ConversationRow | null): string | undefined {
+  const turns = conversation?.recent_messages || [];
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i];
+    if (turn.role !== "user") continue;
+    const url = extractFirstUrl(turn.text);
+    if (url) return url;
+  }
+  return undefined;
+}
+
 function isYouTubeUrl(raw: string): boolean {
   try {
     const hostname = new URL(raw).hostname.toLowerCase();
@@ -886,9 +983,14 @@ function isYouTubeUrl(raw: string): boolean {
   }
 }
 
+function isTubeoVideoRequest(text: string): boolean {
+  return /\b(tubeo|watch\s*later|youtube video|yt video|video)\b/i.test(text) &&
+    !/\b(channel|creator)\b/i.test(text);
+}
+
 function extractSaveNote(text: string, url: string): string | undefined {
   const withoutUrl = text.replace(url, " ").trim();
-  const noteMatch = withoutUrl.match(/\b(?:note|with note|as)\b[:\s-]*(.+)$/i);
+  const noteMatch = withoutUrl.match(/\b(?:note|with note|as)\b[:,\s-]*(.+)$/i);
   const note = noteMatch?.[1]?.trim();
   if (note) return note;
   const cleaned = stripSaveWords(withoutUrl);

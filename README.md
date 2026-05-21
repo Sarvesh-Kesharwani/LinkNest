@@ -3,7 +3,9 @@
 Telegram bot that classifies every message before acting. It saves links to LinkNest, thoughts to ChatThoughts, lists saved records, and can forward explicit YouTube-channel save requests into Tubeo.
 
 - Bare links are not auto-saved; the bot asks what to do.
+- Follow-up instructions can refer to the previous link; the bot resolves it from conversation memory.
 - "Save this link ..." writes to LinkNest `saved_links`, so Tubeo can import it from the shared LinkNest project.
+- "YouTube video note, ..." after a shared YouTube link saves that prior link to Tubeo Watch Later with the note.
 - "Save this thought/note ..." writes to the ChatThoughts table.
 - "List saved links" shows LinkNest links with notes.
 - "List saved thoughts" shows ChatThought records with titles.
