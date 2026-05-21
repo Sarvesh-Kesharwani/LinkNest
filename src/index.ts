@@ -211,7 +211,7 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
     return;
   }
 
-  if (!hasUrl && s.kind === "idle" && CHAT_RE.test(text)) {
+  if (!hasUrl && CHAT_RE.test(text)) {
     await replyWithConversation(ctx, text);
     return;
   }
