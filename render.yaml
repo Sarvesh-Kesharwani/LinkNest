@@ -15,11 +15,21 @@ services:
         sync: false
       - key: LINKNEST_TABLE
         value: linknest_notes
+      - key: LEGACY_LINKS_TABLE
+        value: saved_links
+      - key: LEGACY_ARCHIVE_FETCH_LIMIT
+        value: 200
       - key: CHATTHOUGHTS_SUPABASE_URL
         sync: false
       - key: CHATTHOUGHTS_SUPABASE_KEY
         sync: false
       - key: CHATTHOUGHTS_TABLE
         value: chatthoughts_thoughts
+      - key: TUBEO_API_URL
+        sync: false
+      - key: TUBEO_TELEGRAM_INGEST_SECRET
+        sync: false
+      - key: TUBEO_ALLOWED_TELEGRAM_USER_IDS
+        sync: false
       - key: BOT_MODE
         value: webhook

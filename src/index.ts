@@ -1,7 +1,13 @@
 import "dotenv/config";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import express from "express";
-import { Bot, webhookCallback } from "grammy";
+import {
+  Bot,
+  Context,
+  session,
+  type SessionFlavor,
+  webhookCallback,
+} from "grammy";
 
 const telegramToken = requiredEnv("TELEGRAM_BOT_TOKEN");
 const linknestUrl = requiredEnv("SUPABASE_URL");
@@ -11,6 +17,12 @@ if (!linknestKey) {
   throw new Error("Missing required env var: SUPABASE_KEY");
 }
 const linknestTable = process.env.LINKNEST_TABLE || "linknest_notes";
+const legacyLinksTable = process.env.LEGACY_LINKS_TABLE || "saved_links";
+const legacyArchiveFetchLimit = clampNumber(
+  Number(process.env.LEGACY_ARCHIVE_FETCH_LIMIT || 200),
+  25,
+  1000,
+);
 
 const chatthoughtsUrl = process.env.CHATTHOUGHTS_SUPABASE_URL;
 const chatthoughtsKey =
@@ -20,11 +32,44 @@ const chatthoughtsKey =
 const chatthoughtsTable =
   process.env.CHATTHOUGHTS_TABLE || "chatthoughts_thoughts";
 
+const tubeoApiUrl = process.env.TUBEO_API_URL?.replace(/\/+$/, "");
+const tubeoIngestSecret = process.env.TUBEO_TELEGRAM_INGEST_SECRET;
+const allowedTubeoTelegramUsers = new Set(
+  (process.env.TUBEO_ALLOWED_TELEGRAM_USER_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean),
+);
+
 const botMode =
   process.env.BOT_MODE || (process.env.RENDER ? "webhook" : "polling");
 const port = Number(process.env.PORT || 10000);
 
-const bot = new Bot(telegramToken);
+type ChatState =
+  | { kind: "idle" }
+  | { kind: "awaiting_note"; rowId: string; original: string }
+  | { kind: "last_saved"; rowId: string; combined: string }
+  | {
+      kind: "confirm_update";
+      rowId: string;
+      combined: string;
+      pendingText: string;
+    };
+
+interface SessionData {
+  state: ChatState;
+  lastUrl?: string;
+}
+
+type BotContext = Context & SessionFlavor<SessionData>;
+
+const bot = new Bot<BotContext>(telegramToken);
+
+bot.use(
+  session<SessionData, BotContext>({
+    initial: () => ({ state: { kind: "idle" } }),
+  }),
+);
 
 const linknest: SupabaseClient = createClient(linknestUrl, linknestKey, {
   auth: { persistSession: false },
@@ -37,69 +82,247 @@ const chatthoughts: SupabaseClient | null =
       })
     : null;
 
+const URL_RE = /https?:\/\/\S+/i;
+const YES_RE = /^(y|yes|yeah|sure|ok|okay|update|add)\b/i;
+const NO_RE = /^(n|no|nope|skip|new)\b/i;
+const THOUGHT_RE = /^(thought|thoughts|t)\b/i;
+const TUBEO_INTENT_RE = /\b(tubeo|watch\s*later|watchlater|channel|chanl|chanle|note|update)\b/i;
+
 bot.command("start", async (ctx) => {
+  ctx.session.state = { kind: "idle" };
   await ctx.reply(
-    [
-      "Two commands:",
-      "/linknest <note>  — save a quick note to LinkNest",
-      "/thought  <text>  — save a thought to ChatThoughts",
-    ].join("\n"),
+    "send link or text. i save it. reply with note to add note. say 'thought' to move to thoughts.",
   );
+});
+
+bot.command("reset", async (ctx) => {
+  ctx.session.state = { kind: "idle" };
+  await ctx.reply("reset.");
+});
+
+bot.command("skip", async (ctx) => {
+  const s = ctx.session.state;
+  if (s.kind === "awaiting_note") {
+    ctx.session.state = { kind: "last_saved", rowId: s.rowId, combined: s.original };
+    await ctx.reply("ok.");
+  } else {
+    await ctx.reply("nothing pending.");
+  }
+});
+
+bot.command(["archive", "legacy"], async (ctx) => {
+  await replyWithLegacyArchive(ctx, ctx.match.trim());
 });
 
 bot.command("linknest", async (ctx) => {
   const text = ctx.match.trim();
   if (!text) {
-    await ctx.reply("Use: /linknest <your note>");
+    await ctx.reply("send /linknest <text or url>.");
     return;
   }
-  const sender = ctx.from;
-  if (!sender) {
-    await ctx.reply("Could not identify sender.");
-    return;
-  }
-  const { error } = await linknest.from(linknestTable).insert({
-    sender_id: sender.id,
-    sender_username: sender.username ?? null,
-    chat_id: ctx.chat.id,
-    text: text.slice(0, 5000),
-  });
-  if (error) {
-    console.error("linknest save failed", error);
-    await ctx.reply(`Save failed: ${error.message}`);
-    return;
-  }
-  await ctx.reply("Saved to LinkNest.");
+  await handleTextMessage(ctx, text);
 });
 
 bot.command("thought", async (ctx) => {
-  if (!chatthoughts) {
-    await ctx.reply(
-      "ChatThoughts is not configured on this bot (missing CHATTHOUGHTS_SUPABASE_URL / KEY).",
-    );
-    return;
-  }
   const text = ctx.match.trim();
   if (!text) {
-    await ctx.reply("Use: /thought <your thought>");
+    await ctx.reply("send /thought <text>.");
     return;
   }
-  const trimmed = text.slice(0, 5000);
-  // ChatThoughts encodes the augmented JSON inside the `mantra` column. We
-  // skip AI augmentation from the bot for speed — the web app re-augments on
-  // first edit. Format mirrors `encodeAugmented` in the Next.js app.
-  const mantra = JSON.stringify({ short: trimmed, _raw: trimmed });
-  const { error } = await chatthoughts.from(chatthoughtsTable).insert({
-    when_needed: null,
-    mantra,
-  });
+  if (!chatthoughts) {
+    await ctx.reply("thoughts not configured.");
+    return;
+  }
+  const mantra = JSON.stringify({ short: text, _raw: text });
+  const { error } = await chatthoughts
+    .from(chatthoughtsTable)
+    .insert({ when_needed: null, mantra });
   if (error) {
     console.error("thought save failed", error);
-    await ctx.reply(`Save failed: ${error.message}`);
+    await ctx.reply(`fail: ${error.message}`);
     return;
   }
-  await ctx.reply("Saved to ChatThoughts.");
+  ctx.session.state = { kind: "idle" };
+  await ctx.reply("saved thought.");
 });
+
+bot.on("message:text", async (ctx) => {
+  const text = ctx.message.text.trim();
+  if (!text) return;
+  if (text.startsWith("/")) {
+    await ctx.reply("unknown command. send a link/text, or use /archive, /skip, /reset.");
+    return;
+  }
+  await handleTextMessage(ctx, text);
+});
+
+async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
+  const sender = ctx.from;
+  if (!sender) {
+    await ctx.reply("no sender id.");
+    return;
+  }
+
+  const s = ctx.session.state;
+  const hasUrl = URL_RE.test(text);
+  const currentUrl = extractFirstUrl(text);
+  const replyText = getReplyText(ctx);
+  const replyUrl = replyText ? extractFirstUrl(replyText) : null;
+  const lastUrl = currentUrl || replyUrl || ctx.session.lastUrl;
+  if (currentUrl) ctx.session.lastUrl = currentUrl;
+
+  const shouldCallTubeo =
+    isTubeoConfigured() &&
+    isTubeoUserAllowed(sender.id) &&
+    (hasUrl || Boolean(replyUrl) || TUBEO_INTENT_RE.test(text));
+  if (shouldCallTubeo) {
+    const result = await callTubeoIngest({
+      text,
+      replyText,
+      lastUrl,
+      telegramUserId: sender.id,
+      telegramMessageId: ctx.msg?.message_id ?? 0,
+    });
+    if (result.ok && result.summary) {
+      await ctx.reply(`tubeo: ${result.summary}`);
+    } else if (!result.ok && result.error) {
+      await ctx.reply(`tubeo fail: ${result.error}`);
+    }
+
+    if (!hasUrl && (replyUrl || TUBEO_INTENT_RE.test(text))) {
+      return;
+    }
+  }
+
+  // Global redirect: user says "thought" → move most recent linknest row to chatthoughts.
+  if (
+    THOUGHT_RE.test(text) &&
+    (s.kind === "awaiting_note" ||
+      s.kind === "last_saved" ||
+      s.kind === "confirm_update")
+  ) {
+    const sourceText =
+      s.kind === "awaiting_note" ? s.original : s.kind === "last_saved" ? s.combined : s.combined;
+    if (!chatthoughts) {
+      await ctx.reply("thoughts not configured.");
+      return;
+    }
+    const { error: delErr } = await linknest
+      .from(linknestTable)
+      .delete()
+      .eq("id", s.rowId);
+    if (delErr) {
+      console.error("delete failed", delErr);
+      await ctx.reply(`fail: ${delErr.message}`);
+      return;
+    }
+    const mantra = JSON.stringify({ short: sourceText, _raw: sourceText });
+    const { error: insErr } = await chatthoughts
+      .from(chatthoughtsTable)
+      .insert({ when_needed: null, mantra });
+    if (insErr) {
+      console.error("thought save failed", insErr);
+      await ctx.reply(`fail: ${insErr.message}`);
+      return;
+    }
+    ctx.session.state = { kind: "idle" };
+    await ctx.reply("→ thought.");
+    return;
+  }
+
+  switch (s.kind) {
+    case "idle": {
+      const rowId = await insertLinknest(ctx, text);
+      if (rowId == null) return;
+      if (hasUrl) {
+        ctx.session.state = { kind: "awaiting_note", rowId, original: text };
+        await ctx.reply("note?");
+      } else {
+        ctx.session.state = { kind: "last_saved", rowId, combined: text };
+        await ctx.reply("saved.");
+      }
+      return;
+    }
+
+    case "awaiting_note": {
+      if (NO_RE.test(text)) {
+        ctx.session.state = {
+          kind: "last_saved",
+          rowId: s.rowId,
+          combined: s.original,
+        };
+        await ctx.reply("ok.");
+        return;
+      }
+      const combined = `${s.original}\n\n${text}`;
+      const { error } = await linknest
+        .from(linknestTable)
+        .update({ text: combined.slice(0, 5000) })
+        .eq("id", s.rowId);
+      if (error) {
+        console.error("note update failed", error);
+        await ctx.reply(`fail: ${error.message}`);
+        return;
+      }
+      ctx.session.state = { kind: "last_saved", rowId: s.rowId, combined };
+      await ctx.reply("✓");
+      return;
+    }
+
+    case "last_saved": {
+      if (hasUrl) {
+        const rowId = await insertLinknest(ctx, text);
+        if (rowId == null) return;
+        ctx.session.state = { kind: "awaiting_note", rowId, original: text };
+        await ctx.reply("note?");
+        return;
+      }
+      ctx.session.state = {
+        kind: "confirm_update",
+        rowId: s.rowId,
+        combined: s.combined,
+        pendingText: text,
+      };
+      await ctx.reply("update prev note? (y/n/thought)");
+      return;
+    }
+
+    case "confirm_update": {
+      if (hasUrl) {
+        const rowId = await insertLinknest(ctx, text);
+        if (rowId == null) return;
+        ctx.session.state = { kind: "awaiting_note", rowId, original: text };
+        await ctx.reply("note?");
+        return;
+      }
+      if (YES_RE.test(text)) {
+        const combined = `${s.combined}\n${s.pendingText}`;
+        const { error } = await linknest
+          .from(linknestTable)
+          .update({ text: combined.slice(0, 5000) })
+          .eq("id", s.rowId);
+        if (error) {
+          console.error("note append failed", error);
+          await ctx.reply(`fail: ${error.message}`);
+          return;
+        }
+        ctx.session.state = { kind: "last_saved", rowId: s.rowId, combined };
+        await ctx.reply("✓");
+        return;
+      }
+      // default: treat as new entry
+      const rowId = await insertLinknest(ctx, s.pendingText);
+      if (rowId == null) return;
+      ctx.session.state = {
+        kind: "last_saved",
+        rowId,
+        combined: s.pendingText,
+      };
+      await ctx.reply("saved.");
+      return;
+    }
+  }
+}
 
 bot.catch((err) => {
   console.error("bot error", err);
@@ -115,6 +338,180 @@ if (botMode === "webhook") {
       console.log(`Bot polling as @${botInfo.username}`);
     },
   });
+}
+
+async function insertLinknest(
+  ctx: BotContext,
+  text: string,
+): Promise<string | null> {
+  const sender = ctx.from!;
+  const chatId = ctx.chat?.id;
+  const { data, error } = await linknest
+    .from(linknestTable)
+    .insert({
+      sender_id: sender.id,
+      sender_username: sender.username ?? null,
+      chat_id: chatId,
+      text: text.slice(0, 5000),
+    })
+    .select("id")
+    .single();
+  if (error) {
+    console.error("linknest save failed", error);
+    await ctx.reply(`fail: ${error.message}`);
+    return null;
+  }
+  return (data as { id: string }).id;
+}
+
+interface TubeoIngestPayload {
+  text: string;
+  replyText?: string;
+  lastUrl?: string;
+  telegramUserId: number;
+  telegramMessageId: number;
+}
+
+interface TubeoIngestResponse {
+  ok?: boolean;
+  summary?: string;
+  error?: string;
+  firstUrl?: string | null;
+}
+
+interface LegacySavedLink {
+  id: string;
+  platform: string | null;
+  original_url: string | null;
+  canonical_url: string | null;
+  note: string | null;
+  note_status: string | null;
+  created_at: string | null;
+}
+
+async function replyWithLegacyArchive(ctx: BotContext, query: string): Promise<void> {
+  const sender = ctx.from;
+  if (!sender) {
+    await ctx.reply("no sender id.");
+    return;
+  }
+
+  const { data, error } = await linknest
+    .from(legacyLinksTable)
+    .select("id, platform, original_url, canonical_url, note, note_status, created_at")
+    .eq("sender_id", sender.id)
+    .order("created_at", { ascending: false })
+    .limit(legacyArchiveFetchLimit);
+
+  if (error) {
+    console.error("legacy archive read failed", error);
+    await ctx.reply(`archive fail: ${error.message}`);
+    return;
+  }
+
+  const rows = (data || []) as LegacySavedLink[];
+  const terms = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(Boolean);
+  const filtered =
+    terms.length === 0
+      ? rows
+      : rows.filter((row) => {
+          const haystack = [
+            row.platform,
+            row.original_url,
+            row.canonical_url,
+            row.note,
+            row.note_status,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
+          return terms.every((term) => haystack.includes(term));
+        });
+
+  if (filtered.length === 0) {
+    await ctx.reply(
+      query
+        ? `no legacy links match: ${query}`
+        : "no legacy links found for your Telegram user.",
+    );
+    return;
+  }
+
+  const shown = filtered.slice(0, 8);
+  const header = query
+    ? `legacy archive: ${query}\nshowing ${shown.length}/${filtered.length}`
+    : `legacy archive recent\nshowing ${shown.length}/${filtered.length}`;
+  const body = shown.map(formatLegacyLink).join("\n\n");
+  const suffix =
+    filtered.length > shown.length
+      ? "\n\nnarrow search: /archive youtube ai"
+      : "";
+  await ctx.reply(`${header}\n\n${body}${suffix}`);
+}
+
+function formatLegacyLink(row: LegacySavedLink, index: number): string {
+  const platform = row.platform || "unknown";
+  const created = row.created_at ? row.created_at.slice(0, 10) : "no date";
+  const url = row.original_url || row.canonical_url || "(no url)";
+  const note = row.note?.trim();
+  const noteLine = note ? `\n${truncate(note, 160)}` : "";
+  return `${index + 1}. ${platform} | ${created}${noteLine}\n${truncate(url, 180)}`;
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}...` : value;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
+function isTubeoConfigured(): boolean {
+  return Boolean(tubeoApiUrl && tubeoIngestSecret);
+}
+
+function isTubeoUserAllowed(userId: number): boolean {
+  return allowedTubeoTelegramUsers.size === 0 || allowedTubeoTelegramUsers.has(String(userId));
+}
+
+function extractFirstUrl(text: string | undefined): string | undefined {
+  const match = text?.match(/https?:\/\/[^\s<>"']+/i);
+  return match?.[0]?.replace(/[),.;!?]+$/g, "");
+}
+
+function getReplyText(ctx: BotContext): string | undefined {
+  const reply = ctx.message?.reply_to_message;
+  if (!reply || !("text" in reply) || typeof reply.text !== "string") {
+    return undefined;
+  }
+  return reply.text.trim() || undefined;
+}
+
+async function callTubeoIngest(payload: TubeoIngestPayload): Promise<TubeoIngestResponse> {
+  if (!tubeoApiUrl || !tubeoIngestSecret) return { ok: false, error: "tubeo not configured" };
+
+  try {
+    const response = await fetch(`${tubeoApiUrl}/api/telegram/ingest`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tubeoIngestSecret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = (await response.json().catch(() => null)) as TubeoIngestResponse | null;
+    if (!response.ok || !data?.ok) {
+      return { ok: false, error: data?.error || data?.summary || `Tubeo HTTP ${response.status}` };
+    }
+    return data;
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 async function startWebhookServer(): Promise<void> {
@@ -147,12 +544,13 @@ async function startWebhookServer(): Promise<void> {
 }
 
 async function registerBotCommands(): Promise<void> {
-  // setMyCommands fully replaces the previously registered list — old
-  // commands (/help, /ask, /note, /skip ...) are removed automatically.
   await bot.api.setMyCommands([
+    { command: "start", description: "How to use" },
     { command: "linknest", description: "Save a note to LinkNest" },
     { command: "thought", description: "Save a thought to ChatThoughts" },
-    { command: "start", description: "Show usage" },
+    { command: "archive", description: "Search legacy saved links" },
+    { command: "skip", description: "Skip pending note" },
+    { command: "reset", description: "Reset conversation state" },
   ]);
 }
 
