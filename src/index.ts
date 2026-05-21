@@ -47,14 +47,17 @@ const port = Number(process.env.PORT || 10000);
 
 type ChatState =
   | { kind: "idle" }
-  | { kind: "awaiting_note"; rowId: string; original: string }
-  | { kind: "last_saved"; rowId: string; combined: string }
+  | { kind: "awaiting_note"; rowId: string; target: SaveTarget; original: string }
+  | { kind: "last_saved"; rowId: string; target: SaveTarget; combined: string }
   | {
       kind: "confirm_update";
       rowId: string;
+      target: SaveTarget;
       combined: string;
       pendingText: string;
     };
+
+type SaveTarget = "note" | "saved_link";
 
 interface SessionData {
   state: ChatState;
@@ -103,7 +106,7 @@ bot.command("reset", async (ctx) => {
 bot.command("skip", async (ctx) => {
   const s = ctx.session.state;
   if (s.kind === "awaiting_note") {
-    ctx.session.state = { kind: "last_saved", rowId: s.rowId, combined: s.original };
+    ctx.session.state = { kind: "last_saved", rowId: s.rowId, target: s.target, combined: s.original };
     await ctx.reply("ok.");
   } else {
     await ctx.reply("nothing pending.");
@@ -207,10 +210,7 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
       await ctx.reply("thoughts not configured.");
       return;
     }
-    const { error: delErr } = await linknest
-      .from(linknestTable)
-      .delete()
-      .eq("id", s.rowId);
+    const { error: delErr } = await deleteSavedRow(s.target, s.rowId);
     if (delErr) {
       console.error("delete failed", delErr);
       await ctx.reply(`fail: ${delErr.message}`);
@@ -232,13 +232,15 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
 
   switch (s.kind) {
     case "idle": {
-      const rowId = await insertLinknest(ctx, text);
-      if (rowId == null) return;
       if (hasUrl) {
-        ctx.session.state = { kind: "awaiting_note", rowId, original: text };
+        const rowId = await insertSavedLink(ctx, text);
+        if (rowId == null) return;
+        ctx.session.state = { kind: "awaiting_note", rowId, target: "saved_link", original: text };
         await ctx.reply("note?");
       } else {
-        ctx.session.state = { kind: "last_saved", rowId, combined: text };
+        const rowId = await insertLinknestNote(ctx, text);
+        if (rowId == null) return;
+        ctx.session.state = { kind: "last_saved", rowId, target: "note", combined: text };
         await ctx.reply("saved.");
       }
       return;
@@ -249,37 +251,36 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
         ctx.session.state = {
           kind: "last_saved",
           rowId: s.rowId,
+          target: s.target,
           combined: s.original,
         };
         await ctx.reply("ok.");
         return;
       }
       const combined = `${s.original}\n\n${text}`;
-      const { error } = await linknest
-        .from(linknestTable)
-        .update({ text: combined.slice(0, 5000) })
-        .eq("id", s.rowId);
+      const { error } = await updateSavedRow(s.target, s.rowId, combined);
       if (error) {
         console.error("note update failed", error);
         await ctx.reply(`fail: ${error.message}`);
         return;
       }
-      ctx.session.state = { kind: "last_saved", rowId: s.rowId, combined };
+      ctx.session.state = { kind: "last_saved", rowId: s.rowId, target: s.target, combined };
       await ctx.reply("✓");
       return;
     }
 
     case "last_saved": {
       if (hasUrl) {
-        const rowId = await insertLinknest(ctx, text);
+        const rowId = await insertSavedLink(ctx, text);
         if (rowId == null) return;
-        ctx.session.state = { kind: "awaiting_note", rowId, original: text };
+        ctx.session.state = { kind: "awaiting_note", rowId, target: "saved_link", original: text };
         await ctx.reply("note?");
         return;
       }
       ctx.session.state = {
         kind: "confirm_update",
         rowId: s.rowId,
+        target: s.target,
         combined: s.combined,
         pendingText: text,
       };
@@ -289,33 +290,31 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
 
     case "confirm_update": {
       if (hasUrl) {
-        const rowId = await insertLinknest(ctx, text);
+        const rowId = await insertSavedLink(ctx, text);
         if (rowId == null) return;
-        ctx.session.state = { kind: "awaiting_note", rowId, original: text };
+        ctx.session.state = { kind: "awaiting_note", rowId, target: "saved_link", original: text };
         await ctx.reply("note?");
         return;
       }
       if (YES_RE.test(text)) {
         const combined = `${s.combined}\n${s.pendingText}`;
-        const { error } = await linknest
-          .from(linknestTable)
-          .update({ text: combined.slice(0, 5000) })
-          .eq("id", s.rowId);
+        const { error } = await updateSavedRow(s.target, s.rowId, combined);
         if (error) {
           console.error("note append failed", error);
           await ctx.reply(`fail: ${error.message}`);
           return;
         }
-        ctx.session.state = { kind: "last_saved", rowId: s.rowId, combined };
+        ctx.session.state = { kind: "last_saved", rowId: s.rowId, target: s.target, combined };
         await ctx.reply("✓");
         return;
       }
       // default: treat as new entry
-      const rowId = await insertLinknest(ctx, s.pendingText);
+      const rowId = await insertLinknestNote(ctx, s.pendingText);
       if (rowId == null) return;
       ctx.session.state = {
         kind: "last_saved",
         rowId,
+        target: "note",
         combined: s.pendingText,
       };
       await ctx.reply("saved.");
@@ -340,7 +339,7 @@ if (botMode === "webhook") {
   });
 }
 
-async function insertLinknest(
+async function insertLinknestNote(
   ctx: BotContext,
   text: string,
 ): Promise<string | null> {
@@ -362,6 +361,85 @@ async function insertLinknest(
     return null;
   }
   return (data as { id: string }).id;
+}
+
+async function insertSavedLink(
+  ctx: BotContext,
+  text: string,
+): Promise<string | null> {
+  const sender = ctx.from!;
+  const chatId = ctx.chat?.id;
+  const url = extractFirstUrl(text);
+  if (!url) {
+    await ctx.reply("no url found.");
+    return null;
+  }
+  const canonicalUrl = canonicalizeUrl(url);
+  const existing = await linknest
+    .from(legacyLinksTable)
+    .select("id")
+    .eq("sender_id", sender.id)
+    .eq("canonical_url", canonicalUrl)
+    .maybeSingle();
+  if (existing.error) {
+    console.error("saved link lookup failed", existing.error);
+    await ctx.reply(`fail: ${existing.error.message}`);
+    return null;
+  }
+  if (existing.data) return (existing.data as { id: string }).id;
+
+  const { data, error } = await linknest
+    .from(legacyLinksTable)
+    .insert({
+      sender_id: sender.id,
+      sender_username: sender.username ?? null,
+      chat_id: chatId ?? sender.id,
+      platform: detectPlatform(canonicalUrl),
+      original_url: url,
+      canonical_url: canonicalUrl,
+      note: null,
+      note_status: "pending",
+      telegram_message_id: ctx.msg?.message_id ?? null,
+      metadata: { source: "telegram_linknest_bot" },
+    })
+    .select("id")
+    .single();
+  if (error) {
+    console.error("saved link save failed", error);
+    await ctx.reply(`fail: ${error.message}`);
+    return null;
+  }
+  return (data as { id: string }).id;
+}
+
+async function updateSavedRow(
+  target: SaveTarget,
+  rowId: string,
+  text: string,
+): Promise<{ error: Error | null }> {
+  if (target === "saved_link") {
+    const note = savedLinkNoteFromText(text);
+    const { error } = await linknest
+      .from(legacyLinksTable)
+      .update({ note: note ? note.slice(0, 5000) : null, note_status: note ? "added" : "skipped" })
+      .eq("id", rowId);
+    return { error: error as Error | null };
+  }
+
+  const { error } = await linknest
+    .from(linknestTable)
+    .update({ text: text.slice(0, 5000) })
+    .eq("id", rowId);
+  return { error: error as Error | null };
+}
+
+async function deleteSavedRow(
+  target: SaveTarget,
+  rowId: string,
+): Promise<{ error: Error | null }> {
+  const table = target === "saved_link" ? legacyLinksTable : linknestTable;
+  const { error } = await linknest.from(table).delete().eq("id", rowId);
+  return { error: error as Error | null };
 }
 
 interface TubeoIngestPayload {
@@ -482,6 +560,50 @@ function isTubeoUserAllowed(userId: number): boolean {
 function extractFirstUrl(text: string | undefined): string | undefined {
   const match = text?.match(/https?:\/\/[^\s<>"']+/i);
   return match?.[0]?.replace(/[),.;!?]+$/g, "");
+}
+
+function canonicalizeUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    url.hash = "";
+    const removableParams = [
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "fbclid",
+      "gclid",
+      "igshid",
+      "si",
+    ];
+    for (const param of removableParams) url.searchParams.delete(param);
+
+    if (url.hostname === "youtu.be") {
+      const id = url.pathname.split("/").filter(Boolean)[0];
+      if (id) return `https://www.youtube.com/watch?v=${id}`;
+    }
+
+    url.hostname = url.hostname.replace(/^m\./, "www.");
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return raw.trim();
+  }
+}
+
+function detectPlatform(raw: string): "instagram" | "youtube" | "webpage" | "unknown" {
+  try {
+    const hostname = new URL(raw).hostname.toLowerCase();
+    if (hostname.includes("instagram.com")) return "instagram";
+    if (hostname.includes("youtube.com") || hostname.includes("youtu.be")) return "youtube";
+    return "webpage";
+  } catch {
+    return "unknown";
+  }
+}
+
+function savedLinkNoteFromText(text: string): string {
+  return text.replace(URL_RE, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function getReplyText(ctx: BotContext): string | undefined {

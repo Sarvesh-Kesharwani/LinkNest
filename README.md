@@ -2,7 +2,7 @@
 
 Telegram bot that saves links/text to LinkNest, can move recent text into ChatThoughts, and can forward AI-parsed link intents into Tubeo.
 
-- `/linknest <note>` — save a quick text note to the **LinkNest** Supabase project (`linknest_notes` table).
+- `/linknest <note>` — save quick text notes to the **LinkNest** Supabase project (`linknest_notes` table). URL messages save to `saved_links` so Tubeo can import them from the same LinkNest project.
 - `/thought <text>` — save a raw thought to the **ChatThoughts** Supabase project (`chatthoughts_thoughts` table). The web app at https://chatthoughts.vercel.app re-augments these on first edit.
 - `/archive [query]` — read/search the legacy `saved_links` archive from Telegram. `/legacy [query]` is an alias.
 
