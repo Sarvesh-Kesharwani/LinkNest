@@ -17,8 +17,14 @@ services:
         value: linknest_notes
       - key: LEGACY_LINKS_TABLE
         value: saved_links
+      - key: LINKNEST_CONVERSATION_TABLE
+        value: linknest_conversations
       - key: LEGACY_ARCHIVE_FETCH_LIMIT
         value: 200
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_MODEL
+        value: deepseek-chat
       - key: CHATTHOUGHTS_SUPABASE_URL
         sync: false
       - key: CHATTHOUGHTS_SUPABASE_KEY

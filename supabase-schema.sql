@@ -108,3 +108,45 @@ with check (true);
 
 create index if not exists linknest_notes_sender_created_idx
   on public.linknest_notes (sender_id, created_at desc);
+
+-- Conversation memory ---------------------------------------------------------
+
+create table if not exists public.linknest_conversations (
+  id uuid primary key default gen_random_uuid(),
+  sender_id bigint not null,
+  sender_username text,
+  chat_id bigint not null,
+  summary text not null default '',
+  recent_messages jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now(),
+  unique (sender_id, chat_id)
+);
+
+alter table public.linknest_conversations enable row level security;
+
+grant select, insert, update on public.linknest_conversations to anon;
+
+drop policy if exists linknest_conversations_bot_select on public.linknest_conversations;
+create policy linknest_conversations_bot_select
+on public.linknest_conversations
+for select
+to anon
+using (true);
+
+drop policy if exists linknest_conversations_bot_insert on public.linknest_conversations;
+create policy linknest_conversations_bot_insert
+on public.linknest_conversations
+for insert
+to anon
+with check (true);
+
+drop policy if exists linknest_conversations_bot_update on public.linknest_conversations;
+create policy linknest_conversations_bot_update
+on public.linknest_conversations
+for update
+to anon
+using (true)
+with check (true);
+
+create index if not exists linknest_conversations_sender_updated_idx
+  on public.linknest_conversations (sender_id, updated_at desc);

@@ -18,11 +18,15 @@ if (!linknestKey) {
 }
 const linknestTable = process.env.LINKNEST_TABLE || "linknest_notes";
 const legacyLinksTable = process.env.LEGACY_LINKS_TABLE || "saved_links";
+const conversationTable =
+  process.env.LINKNEST_CONVERSATION_TABLE || "linknest_conversations";
 const legacyArchiveFetchLimit = clampNumber(
   Number(process.env.LEGACY_ARCHIVE_FETCH_LIMIT || 200),
   25,
   1000,
 );
+const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
+const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-chat";
 
 const chatthoughtsUrl = process.env.CHATTHOUGHTS_SUPABASE_URL;
 const chatthoughtsKey =
@@ -90,26 +94,31 @@ const YES_RE = /^(y|yes|yeah|sure|ok|okay|update|add)\b/i;
 const NO_RE = /^(n|no|nope|skip|new)\b/i;
 const THOUGHT_RE = /^(thought|thoughts|t)\b/i;
 const TUBEO_INTENT_RE = /\b(tubeo|watch\s*later|watchlater|channel|chanl|chanle|note|update)\b/i;
+const SAVED_QUESTION_RE =
+  /\b(what|which|show|tell)\b[\s\S]{0,40}\b(save|saved|store|stored)\b|\blast\s+(saved|save)\b/i;
+const CHAT_RE = /\b(hi|hello|hey|thanks|thank you|who are you|what can you do|help)\b/i;
 
 bot.command("start", async (ctx) => {
   ctx.session.state = { kind: "idle" };
-  await ctx.reply(
-    "send link or text. i save it. reply with note to add note. say 'thought' to move to thoughts.",
+  await replyAndRemember(
+    ctx,
+    "/start",
+    "send link to save it. reply with note. ask \"what did you save?\" anytime.",
   );
 });
 
 bot.command("reset", async (ctx) => {
   ctx.session.state = { kind: "idle" };
-  await ctx.reply("reset.");
+  await replyAndRemember(ctx, "/reset", "reset.");
 });
 
 bot.command("skip", async (ctx) => {
   const s = ctx.session.state;
   if (s.kind === "awaiting_note") {
     ctx.session.state = { kind: "last_saved", rowId: s.rowId, target: s.target, combined: s.original };
-    await ctx.reply("ok.");
+    await replyAndRemember(ctx, "/skip", "ok.");
   } else {
-    await ctx.reply("nothing pending.");
+    await replyAndRemember(ctx, "/skip", "nothing pending.");
   }
 });
 
@@ -120,7 +129,7 @@ bot.command(["archive", "legacy"], async (ctx) => {
 bot.command("linknest", async (ctx) => {
   const text = ctx.match.trim();
   if (!text) {
-    await ctx.reply("send /linknest <text or url>.");
+    await replyAndRemember(ctx, "/linknest", "send /linknest <text or url>.");
     return;
   }
   await handleTextMessage(ctx, text);
@@ -129,11 +138,11 @@ bot.command("linknest", async (ctx) => {
 bot.command("thought", async (ctx) => {
   const text = ctx.match.trim();
   if (!text) {
-    await ctx.reply("send /thought <text>.");
+    await replyAndRemember(ctx, "/thought", "send /thought <text>.");
     return;
   }
   if (!chatthoughts) {
-    await ctx.reply("thoughts not configured.");
+    await replyAndRemember(ctx, text, "thoughts not configured.");
     return;
   }
   const mantra = JSON.stringify({ short: text, _raw: text });
@@ -142,18 +151,18 @@ bot.command("thought", async (ctx) => {
     .insert({ when_needed: null, mantra });
   if (error) {
     console.error("thought save failed", error);
-    await ctx.reply(`fail: ${error.message}`);
+    await replyAndRemember(ctx, text, `fail: ${error.message}`);
     return;
   }
   ctx.session.state = { kind: "idle" };
-  await ctx.reply("saved thought.");
+  await replyAndRemember(ctx, text, "saved thought.");
 });
 
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text) return;
   if (text.startsWith("/")) {
-    await ctx.reply("unknown command. send a link/text, or use /archive, /skip, /reset.");
+    await replyAndRemember(ctx, text, "unknown command. send a link/text, or use /archive, /skip, /reset.");
     return;
   }
   await handleTextMessage(ctx, text);
@@ -162,7 +171,7 @@ bot.on("message:text", async (ctx) => {
 async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
   const sender = ctx.from;
   if (!sender) {
-    await ctx.reply("no sender id.");
+    await replyAndRemember(ctx, text, "no sender id.");
     return;
   }
 
@@ -187,9 +196,9 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
       telegramMessageId: ctx.msg?.message_id ?? 0,
     });
     if (result.ok && result.summary) {
-      await ctx.reply(`tubeo: ${result.summary}`);
+      await replyAndRemember(ctx, text, `tubeo: ${result.summary}`);
     } else if (!result.ok && result.error) {
-      await ctx.reply(`tubeo fail: ${result.error}`);
+      await replyAndRemember(ctx, text, `tubeo fail: ${result.error}`);
     }
 
     if (!hasUrl && (replyUrl || TUBEO_INTENT_RE.test(text))) {
@@ -197,7 +206,17 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
     }
   }
 
-  // Global redirect: user says "thought" → move most recent linknest row to chatthoughts.
+  if (!hasUrl && SAVED_QUESTION_RE.test(text)) {
+    await replyWithSaveMemory(ctx, text);
+    return;
+  }
+
+  if (!hasUrl && s.kind === "idle" && CHAT_RE.test(text)) {
+    await replyWithConversation(ctx, text);
+    return;
+  }
+
+  // Global redirect: user says "thought" -> move most recent linknest row to chatthoughts.
   if (
     THOUGHT_RE.test(text) &&
     (s.kind === "awaiting_note" ||
@@ -207,13 +226,13 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
     const sourceText =
       s.kind === "awaiting_note" ? s.original : s.kind === "last_saved" ? s.combined : s.combined;
     if (!chatthoughts) {
-      await ctx.reply("thoughts not configured.");
+      await replyAndRemember(ctx, text, "thoughts not configured.");
       return;
     }
     const { error: delErr } = await deleteSavedRow(s.target, s.rowId);
     if (delErr) {
       console.error("delete failed", delErr);
-      await ctx.reply(`fail: ${delErr.message}`);
+      await replyAndRemember(ctx, text, `fail: ${delErr.message}`);
       return;
     }
     const mantra = JSON.stringify({ short: sourceText, _raw: sourceText });
@@ -222,11 +241,11 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
       .insert({ when_needed: null, mantra });
     if (insErr) {
       console.error("thought save failed", insErr);
-      await ctx.reply(`fail: ${insErr.message}`);
+      await replyAndRemember(ctx, text, `fail: ${insErr.message}`);
       return;
     }
     ctx.session.state = { kind: "idle" };
-    await ctx.reply("→ thought.");
+    await replyAndRemember(ctx, text, "moved to thought.");
     return;
   }
 
@@ -236,12 +255,12 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
         const rowId = await insertSavedLink(ctx, text);
         if (rowId == null) return;
         ctx.session.state = { kind: "awaiting_note", rowId, target: "saved_link", original: text };
-        await ctx.reply("note?");
+        await replyAndRemember(ctx, text, "saved link. want to add a note?");
       } else {
         const rowId = await insertLinknestNote(ctx, text);
         if (rowId == null) return;
         ctx.session.state = { kind: "last_saved", rowId, target: "note", combined: text };
-        await ctx.reply("saved.");
+        await replyAndRemember(ctx, text, "saved.");
       }
       return;
     }
@@ -254,18 +273,18 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
           target: s.target,
           combined: s.original,
         };
-        await ctx.reply("ok.");
+        await replyAndRemember(ctx, text, "ok, saved without note.");
         return;
       }
       const combined = `${s.original}\n\n${text}`;
       const { error } = await updateSavedRow(s.target, s.rowId, combined);
       if (error) {
         console.error("note update failed", error);
-        await ctx.reply(`fail: ${error.message}`);
+        await replyAndRemember(ctx, text, `fail: ${error.message}`);
         return;
       }
       ctx.session.state = { kind: "last_saved", rowId: s.rowId, target: s.target, combined };
-      await ctx.reply("✓");
+      await replyAndRemember(ctx, text, "added that note.");
       return;
     }
 
@@ -274,7 +293,7 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
         const rowId = await insertSavedLink(ctx, text);
         if (rowId == null) return;
         ctx.session.state = { kind: "awaiting_note", rowId, target: "saved_link", original: text };
-        await ctx.reply("note?");
+        await replyAndRemember(ctx, text, "saved link. want to add a note?");
         return;
       }
       ctx.session.state = {
@@ -284,7 +303,7 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
         combined: s.combined,
         pendingText: text,
       };
-      await ctx.reply("update prev note? (y/n/thought)");
+      await replyAndRemember(ctx, text, "add this to the previous saved item? reply yes/no, or say thought.");
       return;
     }
 
@@ -293,7 +312,7 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
         const rowId = await insertSavedLink(ctx, text);
         if (rowId == null) return;
         ctx.session.state = { kind: "awaiting_note", rowId, target: "saved_link", original: text };
-        await ctx.reply("note?");
+        await replyAndRemember(ctx, text, "saved link. want to add a note?");
         return;
       }
       if (YES_RE.test(text)) {
@@ -301,11 +320,11 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
         const { error } = await updateSavedRow(s.target, s.rowId, combined);
         if (error) {
           console.error("note append failed", error);
-          await ctx.reply(`fail: ${error.message}`);
+          await replyAndRemember(ctx, text, `fail: ${error.message}`);
           return;
         }
         ctx.session.state = { kind: "last_saved", rowId: s.rowId, target: s.target, combined };
-        await ctx.reply("✓");
+        await replyAndRemember(ctx, text, "updated previous saved item.");
         return;
       }
       // default: treat as new entry
@@ -317,7 +336,7 @@ async function handleTextMessage(ctx: BotContext, text: string): Promise<void> {
         target: "note",
         combined: s.pendingText,
       };
-      await ctx.reply("saved.");
+      await replyAndRemember(ctx, text, "saved as a new note.");
       return;
     }
   }
@@ -357,7 +376,7 @@ async function insertLinknestNote(
     .single();
   if (error) {
     console.error("linknest save failed", error);
-    await ctx.reply(`fail: ${error.message}`);
+    await replyAndRemember(ctx, text, `fail: ${error.message}`);
     return null;
   }
   return (data as { id: string }).id;
@@ -371,7 +390,7 @@ async function insertSavedLink(
   const chatId = ctx.chat?.id;
   const url = extractFirstUrl(text);
   if (!url) {
-    await ctx.reply("no url found.");
+    await replyAndRemember(ctx, text, "no url found.");
     return null;
   }
   const canonicalUrl = canonicalizeUrl(url);
@@ -383,7 +402,7 @@ async function insertSavedLink(
     .maybeSingle();
   if (existing.error) {
     console.error("saved link lookup failed", existing.error);
-    await ctx.reply(`fail: ${existing.error.message}`);
+    await replyAndRemember(ctx, text, `fail: ${existing.error.message}`);
     return null;
   }
   if (existing.data) return (existing.data as { id: string }).id;
@@ -406,7 +425,7 @@ async function insertSavedLink(
     .single();
   if (error) {
     console.error("saved link save failed", error);
-    await ctx.reply(`fail: ${error.message}`);
+    await replyAndRemember(ctx, text, `fail: ${error.message}`);
     return null;
   }
   return (data as { id: string }).id;
@@ -467,10 +486,244 @@ interface LegacySavedLink {
   created_at: string | null;
 }
 
+interface LinknestNoteRow {
+  id: string;
+  text: string | null;
+  created_at: string | null;
+}
+
+interface ConversationTurn {
+  role: "user" | "bot";
+  text: string;
+  at: string;
+}
+
+interface ConversationRow {
+  summary: string | null;
+  recent_messages: ConversationTurn[] | null;
+}
+
+async function replyAndRemember(
+  ctx: BotContext,
+  userText: string,
+  botText: string,
+): Promise<void> {
+  await ctx.reply(botText);
+  await rememberTurn(ctx, userText, botText).catch((error) => {
+    console.error("conversation memory failed", error);
+  });
+}
+
+async function rememberTurn(
+  ctx: BotContext,
+  userText: string,
+  botText: string,
+): Promise<void> {
+  const sender = ctx.from;
+  if (!sender) return;
+  const chatId = ctx.chat?.id ?? sender.id;
+  const now = new Date().toISOString();
+
+  const { data, error } = await linknest
+    .from(conversationTable)
+    .select("summary, recent_messages")
+    .eq("sender_id", sender.id)
+    .eq("chat_id", chatId)
+    .maybeSingle();
+  if (error) throw error;
+
+  const row = data as ConversationRow | null;
+  const previous = Array.isArray(row?.recent_messages) ? row.recent_messages : [];
+  const next = [
+    ...previous,
+    { role: "user" as const, text: userText.slice(0, 2000), at: now },
+    { role: "bot" as const, text: botText.slice(0, 2000), at: now },
+  ];
+  const overflow = next.length > 20 ? next.slice(0, next.length - 16) : [];
+  const recent = next.slice(-16);
+  const summary =
+    overflow.length > 0
+      ? await summarizeConversation(row?.summary || "", overflow)
+      : row?.summary || "";
+
+  const { error: upsertError } = await linknest
+    .from(conversationTable)
+    .upsert(
+      {
+        sender_id: sender.id,
+        sender_username: sender.username ?? null,
+        chat_id: chatId,
+        summary,
+        recent_messages: recent,
+        updated_at: now,
+      },
+      { onConflict: "sender_id,chat_id" },
+    );
+  if (upsertError) throw upsertError;
+}
+
+async function summarizeConversation(
+  existingSummary: string,
+  turns: ConversationTurn[],
+): Promise<string> {
+  const transcript = turns
+    .map((turn) => `${turn.role}: ${turn.text}`)
+    .join("\n")
+    .slice(0, 12000);
+  const fallback = truncate(
+    `${existingSummary ? `${existingSummary}\n` : ""}${transcript}`,
+    3000,
+  );
+  if (!deepseekApiKey) return fallback;
+
+  const response = await callDeepSeek([
+    {
+      role: "system",
+      content:
+        "Summarize this Telegram bot conversation for future context. Keep durable facts, user preferences, open tasks, last saved items, and unresolved questions. Be concise.",
+    },
+    {
+      role: "user",
+      content: `Previous summary:\n${existingSummary || "(none)"}\n\nNew turns:\n${transcript}`,
+    },
+  ]);
+  return truncate(response || fallback, 3000);
+}
+
+async function replyWithConversation(ctx: BotContext, text: string): Promise<void> {
+  const sender = ctx.from;
+  if (!sender) {
+    await replyAndRemember(ctx, text, "no sender id.");
+    return;
+  }
+  const conversation = await readConversation(ctx);
+  const fallback =
+    "I can save links, remember notes, and answer what I saved recently. Send a link and I'll store it.";
+  if (!deepseekApiKey) {
+    await replyAndRemember(ctx, text, fallback);
+    return;
+  }
+
+  const recent = (conversation?.recent_messages || [])
+    .map((turn) => `${turn.role}: ${turn.text}`)
+    .join("\n");
+  const answer = await callDeepSeek([
+    {
+      role: "system",
+      content:
+        "You are LinkNest, a concise human Telegram assistant. Use the summary and recent turns. Do not claim to save something unless the conversation or database says so.",
+    },
+    {
+      role: "user",
+      content: `Conversation summary:\n${conversation?.summary || "(none)"}\n\nRecent turns:\n${recent || "(none)"}\n\nUser now says:\n${text}`,
+    },
+  ]).catch((error) => {
+    console.error("conversation AI failed", error);
+    return fallback;
+  });
+  await replyAndRemember(ctx, text, answer || fallback);
+}
+
+async function replyWithSaveMemory(ctx: BotContext, text: string): Promise<void> {
+  const sender = ctx.from;
+  if (!sender) {
+    await replyAndRemember(ctx, text, "no sender id.");
+    return;
+  }
+
+  const [linkResult, noteResult] = await Promise.all([
+    linknest
+      .from(legacyLinksTable)
+      .select("id, platform, original_url, canonical_url, note, note_status, created_at")
+      .eq("sender_id", sender.id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    linknest
+      .from(linknestTable)
+      .select("id, text, created_at")
+      .eq("sender_id", sender.id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+
+  if (linkResult.error) {
+    await replyAndRemember(ctx, text, `save lookup failed: ${linkResult.error.message}`);
+    return;
+  }
+  if (noteResult.error) {
+    await replyAndRemember(ctx, text, `note lookup failed: ${noteResult.error.message}`);
+    return;
+  }
+
+  const link = linkResult.data as LegacySavedLink | null;
+  const note = noteResult.data as LinknestNoteRow | null;
+  const linkTime = link?.created_at ? Date.parse(link.created_at) : 0;
+  const noteTime = note?.created_at ? Date.parse(note.created_at) : 0;
+
+  if (!link && !note) {
+    await replyAndRemember(ctx, text, "I haven't saved anything for you yet.");
+    return;
+  }
+
+  if (link && linkTime >= noteTime) {
+    const url = link.original_url || link.canonical_url || "(no url)";
+    const noteText = link.note?.trim();
+    const reply = noteText
+      ? `Last saved: ${url}\nNote: ${truncate(noteText, 500)}`
+      : `Last saved: ${url}`;
+    await replyAndRemember(ctx, text, reply);
+    return;
+  }
+
+  await replyAndRemember(ctx, text, `Last saved note: ${truncate(note?.text || "", 700)}`);
+}
+
+async function readConversation(ctx: BotContext): Promise<ConversationRow | null> {
+  const sender = ctx.from;
+  if (!sender) return null;
+  const chatId = ctx.chat?.id ?? sender.id;
+  const { data, error } = await linknest
+    .from(conversationTable)
+    .select("summary, recent_messages")
+    .eq("sender_id", sender.id)
+    .eq("chat_id", chatId)
+    .maybeSingle();
+  if (error) throw error;
+  return data as ConversationRow | null;
+}
+
+async function callDeepSeek(
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+): Promise<string> {
+  if (!deepseekApiKey) return "";
+  const response = await fetch("https://api.deepseek.com/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${deepseekApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: deepseekModel,
+      messages,
+      temperature: 0.4,
+      max_tokens: 500,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`DeepSeek HTTP ${response.status}: ${await response.text()}`);
+  }
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  return data.choices?.[0]?.message?.content?.trim() || "";
+}
+
 async function replyWithLegacyArchive(ctx: BotContext, query: string): Promise<void> {
   const sender = ctx.from;
   if (!sender) {
-    await ctx.reply("no sender id.");
+    await replyAndRemember(ctx, `/archive ${query}`.trim(), "no sender id.");
     return;
   }
 
@@ -483,7 +736,7 @@ async function replyWithLegacyArchive(ctx: BotContext, query: string): Promise<v
 
   if (error) {
     console.error("legacy archive read failed", error);
-    await ctx.reply(`archive fail: ${error.message}`);
+    await replyAndRemember(ctx, `/archive ${query}`.trim(), `archive fail: ${error.message}`);
     return;
   }
 
@@ -511,7 +764,9 @@ async function replyWithLegacyArchive(ctx: BotContext, query: string): Promise<v
         });
 
   if (filtered.length === 0) {
-    await ctx.reply(
+    await replyAndRemember(
+      ctx,
+      `/archive ${query}`.trim(),
       query
         ? `no legacy links match: ${query}`
         : "no legacy links found for your Telegram user.",
@@ -528,7 +783,7 @@ async function replyWithLegacyArchive(ctx: BotContext, query: string): Promise<v
     filtered.length > shown.length
       ? "\n\nnarrow search: /archive youtube ai"
       : "";
-  await ctx.reply(`${header}\n\n${body}${suffix}`);
+  await replyAndRemember(ctx, `/archive ${query}`.trim(), `${header}\n\n${body}${suffix}`);
 }
 
 function formatLegacyLink(row: LegacySavedLink, index: number): string {

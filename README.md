@@ -30,7 +30,9 @@ Keep all Supabase keys server-only.
 | `SUPABASE_URL` / `SUPABASE_KEY` | LinkNest project (for `/linknest`) |
 | `LINKNEST_TABLE` | Default `linknest_notes` |
 | `LEGACY_LINKS_TABLE` | Default `saved_links` |
+| `LINKNEST_CONVERSATION_TABLE` | Default `linknest_conversations` |
 | `LEGACY_ARCHIVE_FETCH_LIMIT` | Default `200`; max legacy rows fetched before in-bot filtering |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` | Optional AI replies and conversation summarization |
 | `CHATTHOUGHTS_SUPABASE_URL` / `CHATTHOUGHTS_SUPABASE_KEY` | ChatThoughts project (for `/thought`) |
 | `CHATTHOUGHTS_TABLE` | Default `chatthoughts_thoughts` |
 | `TUBEO_API_URL` / `TUBEO_TELEGRAM_INGEST_SECRET` | Tubeo ingest endpoint + shared secret |
