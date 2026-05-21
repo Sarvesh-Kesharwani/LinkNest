@@ -31,6 +31,12 @@ services:
         sync: false
       - key: CHATTHOUGHTS_TABLE
         value: chatthoughts_thoughts
+      - key: CHATTHOUGHTS_SCHEMA
+        sync: false
+      - key: CHATTHOUGHTS_NEED_COLUMN
+        sync: false
+      - key: CHATTHOUGHTS_TITLE_COLUMN
+        sync: false
       - key: TUBEO_API_URL
         sync: false
       - key: TUBEO_TELEGRAM_INGEST_SECRET
