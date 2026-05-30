@@ -1,50 +1,42 @@
-# LinkNest Bot
+# Tubeo Telegram Bot
 
-Telegram bot that classifies every message before acting. It saves links to LinkNest, thoughts to ChatThoughts, lists saved records, and can forward explicit YouTube-channel save requests into Tubeo.
+Telegram bot that stores shared links directly in Tubeo tables inside the TodoTrails/Turo Supabase project.
 
-- Bare links are not auto-saved; the bot asks what to do.
-- Follow-up instructions can refer to the previous link; the bot resolves it from conversation memory.
-- "Save this link ..." writes to LinkNest `saved_links`, so Tubeo can import it from the shared LinkNest project.
-- "YouTube video note, ..." after a shared YouTube link saves that prior link to Tubeo Watch Later with the note.
-- "Save this thought/note ..." writes to the ChatThoughts table.
-- "List saved links" shows LinkNest links with notes.
-- "List saved thoughts" shows ChatThought records with titles.
+- Bare links are never auto-saved; the bot asks whether to save as Watch Later video/link or YouTube channel.
+- Watch Later saves write to `tubeo_saved_videos`.
+- YouTube channels write to `tubeo_user_sync_state.state.channels`.
+- Replying to a human or bot message with a link updates/saves that previous link.
+- Notes can be included in the same message, e.g. `youtube video note, funny comedy pakistaani accent`.
 
 ## Setup
 
 1. Create bot in Telegram with `@BotFather`, copy token.
-2. **LinkNest Supabase** - run `supabase-schema.sql` in the SQL editor (idempotent; creates `saved_links`, `linknest_notes`, and `linknest_conversations`).
-3. **ChatThoughts Supabase** - already provisioned in the `todotrails` project. The bot writes into `chatthoughts_thoughts` directly.
-4. Copy `.env.example` to `.env` and fill values.
-5. **Tubeo ingest** - optional. Set `TUBEO_API_URL` and the same `TUBEO_TELEGRAM_INGEST_SECRET` as Tubeo to save links to Tubeo Watch Later, update notes, and add YouTube channels.
-6. Run:
+2. In the TodoTrails/Turo Supabase project, run:
+   - `D:\Tubeo\docs\supabase-saved-videos-schema.sql`
+   - `D:\Tubeo\docs\supabase-sync-schema.sql`
+3. Copy `.env.example` to `.env` and fill values.
+4. Run:
 
 ```bash
 npm install
 npm run dev
 ```
 
-Keep all Supabase keys server-only.
-
-## Env vars
+## Env Vars
 
 | Key | Purpose |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | BotFather token |
-| `SUPABASE_URL` / `SUPABASE_KEY` | LinkNest project for links and bot memory |
-| `LINKNEST_TABLE` | Default `linknest_notes` |
-| `LEGACY_LINKS_TABLE` | Default `saved_links` |
-| `LINKNEST_CONVERSATION_TABLE` | Default `linknest_conversations` |
-| `LEGACY_ARCHIVE_FETCH_LIMIT` | Default `200`; max legacy rows fetched before in-bot filtering |
-| `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` | Optional AI replies and conversation summarization |
-| `CHATTHOUGHTS_SUPABASE_URL` / `CHATTHOUGHTS_SUPABASE_KEY` | ChatThoughts project for thought saves |
-| `CHATTHOUGHTS_TABLE` | Default `chatthoughts_thoughts` |
-| `CHATTHOUGHTS_SCHEMA` | Optional; use `chatthoughts` with table `thoughts` |
-| `CHATTHOUGHTS_NEED_COLUMN` / `CHATTHOUGHTS_TITLE_COLUMN` | Defaults `when_needed` / `mantra`; use `need_when` / `mantra` for `chatthoughts.thoughts` |
-| `TUBEO_API_URL` / `TUBEO_TELEGRAM_INGEST_SECRET` | Tubeo ingest endpoint + shared secret |
-| `TUBEO_ALLOWED_TELEGRAM_USER_IDS` | Optional comma-separated allowlist |
-| `BOT_MODE` | `polling` (dev) or `webhook` (Render) |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` | Optional classifier for natural follow-up messages |
+| `YOUTUBE_API_KEY` | Required to resolve channel from YouTube video link or handle |
+| `TUBEO_SUPABASE_URL` | TodoTrails/Turo Supabase project URL |
+| `TUBEO_SUPABASE_SERVICE_ROLE_KEY` | Server-only Supabase service role key |
+| `TUBEO_SUPABASE_SYNC_TABLE` | Default `tubeo_user_sync_state` |
+| `TUBEO_SUPABASE_SAVED_VIDEOS_TABLE` | Default `tubeo_saved_videos` |
+| `TUBEO_TELEGRAM_OWNER_EMAIL` | Tubeo account email whose data should be updated |
+| `TUBEO_TELEGRAM_OWNER_NAME` | Optional display name |
+| `BOT_MODE` | `polling` locally, `webhook` on Render |
 
-## Deploy (Render)
+## Deploy
 
-`render.yaml` describes the service. Push to `main` and Render auto-deploys.
+`render.yaml` describes the Render service. Push to `main`; Render auto-deploys if linked.

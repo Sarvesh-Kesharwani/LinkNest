@@ -9,39 +9,23 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
-        sync: false
-      - key: LINKNEST_TABLE
-        value: linknest_notes
-      - key: LEGACY_LINKS_TABLE
-        value: saved_links
-      - key: LINKNEST_CONVERSATION_TABLE
-        value: linknest_conversations
-      - key: LEGACY_ARCHIVE_FETCH_LIMIT
-        value: 200
       - key: DEEPSEEK_API_KEY
         sync: false
       - key: DEEPSEEK_MODEL
         value: deepseek-chat
-      - key: CHATTHOUGHTS_SUPABASE_URL
+      - key: YOUTUBE_API_KEY
         sync: false
-      - key: CHATTHOUGHTS_SUPABASE_KEY
+      - key: TUBEO_SUPABASE_URL
         sync: false
-      - key: CHATTHOUGHTS_TABLE
-        value: chatthoughts_thoughts
-      - key: CHATTHOUGHTS_SCHEMA
+      - key: TUBEO_SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: CHATTHOUGHTS_NEED_COLUMN
+      - key: TUBEO_SUPABASE_SYNC_TABLE
+        value: tubeo_user_sync_state
+      - key: TUBEO_SUPABASE_SAVED_VIDEOS_TABLE
+        value: tubeo_saved_videos
+      - key: TUBEO_TELEGRAM_OWNER_EMAIL
         sync: false
-      - key: CHATTHOUGHTS_TITLE_COLUMN
-        sync: false
-      - key: TUBEO_API_URL
-        sync: false
-      - key: TUBEO_TELEGRAM_INGEST_SECRET
-        sync: false
-      - key: TUBEO_ALLOWED_TELEGRAM_USER_IDS
+      - key: TUBEO_TELEGRAM_OWNER_NAME
         sync: false
       - key: BOT_MODE
         value: webhook
