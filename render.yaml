@@ -9,18 +9,10 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: DEEPSEEK_API_KEY
-        sync: false
-      - key: DEEPSEEK_MODEL
-        value: deepseek-chat
-      - key: YOUTUBE_API_KEY
-        sync: false
       - key: TUBEO_SUPABASE_URL
         sync: false
       - key: TUBEO_SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: TUBEO_SUPABASE_SYNC_TABLE
-        value: tubeo_user_sync_state
       - key: TUBEO_SUPABASE_SAVED_VIDEOS_TABLE
         value: tubeo_saved_videos
       - key: TUBEO_TELEGRAM_OWNER_EMAIL
